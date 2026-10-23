@@ -531,12 +531,21 @@ def test_research_agent_source_provenance_and_separation():
 
 
 @pytest.mark.live
-def test_live_research_smoke_test():
+def test_live_research_smoke_test(request):
     """Live integration smoke test running real Serper, Open-Meteo, and Groq requests.
 
-    Skipped if valid SERPER_API_KEY and GROQ_API_KEY are not present in environment.
+    Explicit opt-in only: runs only when requested via RUN_LIVE_TESTS=1 or `pytest -m live`.
+    Skipped by default during standard test runs to avoid consuming external API credits.
     """
     import os
+    run_live = (
+        os.getenv("RUN_LIVE_TESTS", "").lower() in ("1", "true", "yes")
+        or request.config.getoption("-m") == "live"
+        or "live" in getattr(request.config.option, "markexpr", "")
+    )
+    if not run_live:
+        pytest.skip("Live smoke test skipped by default. Run with `RUN_LIVE_TESTS=1 pytest` or `pytest -m live` to opt in.")
+
     serper_key = os.getenv("SERPER_API_KEY", "").strip()
     groq_key = os.getenv("GROQ_API_KEY", "").strip()
 

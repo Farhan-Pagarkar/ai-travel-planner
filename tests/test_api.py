@@ -105,7 +105,9 @@ def test_reject_plan_produces_revised_draft_and_pauses(client: TestClient, sampl
     revised_draft = data["draft_itinerary"]
     assert "Revision 1" in revised_draft["summary"]
     activities_text = " ".join(
-        act for day in revised_draft["days"] for act in day["activities"]
+        act.get("description", "") if isinstance(act, dict) else str(act)
+        for day in revised_draft["days"]
+        for act in day["activities"]
     )
     assert "Trastevere" in activities_text
 
@@ -128,7 +130,9 @@ def test_modify_plan_incorporates_requested_change_and_pauses(
     assert data["revision_count"] == 1
 
     activities_text = " ".join(
-        act for day in data["draft_itinerary"]["days"] for act in day["activities"]
+        act.get("description", "") if isinstance(act, dict) else str(act)
+        for day in data["draft_itinerary"]["days"]
+        for act in day["activities"]
     )
     assert "pasta making class" in activities_text
 

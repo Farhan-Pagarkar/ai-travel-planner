@@ -112,7 +112,9 @@ def test_reject_with_feedback_updates_draft_and_returns_to_review(
         assert "Revision 1" in revised_draft["summary"]
         # Check that feedback is recorded in the activity list
         activities_text = " ".join(
-            act for day in revised_draft["days"] for act in day["activities"]
+            act.get("description", "") if isinstance(act, dict) else str(act)
+            for day in revised_draft["days"]
+            for act in day["activities"]
         )
         assert "Budget is fine but include more morning temple walks" in activities_text
 
@@ -164,7 +166,9 @@ def test_modifications_incorporated_into_revised_draft(
         assert state.values["requested_modifications"] == mod_payload["modifications"]
 
         activities_text = " ".join(
-            act for day in state.values["draft_itinerary"]["days"] for act in day["activities"]
+            act.get("description", "") if isinstance(act, dict) else str(act)
+            for day in state.values["draft_itinerary"]["days"]
+            for act in day["activities"]
         )
         assert "private culinary cooking class" in activities_text
 

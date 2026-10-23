@@ -4,7 +4,7 @@ from typing import Any
 from langgraph.types import interrupt
 
 from app.agents.itinerary_validator import run_validator_placeholder
-from app.agents.planner import run_planner_placeholder
+from app.agents.planner import run_planner_agent
 from app.agents.researcher import run_researcher_agent
 from app.graph.state import TravelPlanState
 from app.schemas.request import TravelRequest
@@ -46,7 +46,7 @@ def planner_agent(state: TravelPlanState) -> dict[str, Any]:
     """Generate initial structured day-by-day itinerary."""
     request = state["request"]
     research = state.get("research_results")
-    draft = run_planner_placeholder(
+    draft = run_planner_agent(
         request=request,
         research=research,
         revision_count=state.get("revision_count", 0),
@@ -111,7 +111,7 @@ def revise_itinerary(state: TravelPlanState) -> dict[str, Any]:
     feedback = state.get("review_feedback")
     modifications = state.get("requested_modifications")
 
-    revised_draft = run_planner_placeholder(
+    revised_draft = run_planner_agent(
         request=request,
         research=research,
         feedback=feedback,

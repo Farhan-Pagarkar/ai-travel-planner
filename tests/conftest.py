@@ -98,3 +98,136 @@ def mock_researcher_in_workflow_tests(request, monkeypatch):
 
         monkeypatch.setattr("app.graph.nodes.run_researcher_agent", fake_research)
         monkeypatch.setattr("app.agents.researcher.run_researcher_agent", fake_research)
+
+
+@pytest.fixture(autouse=True)
+def mock_planner_in_workflow_tests(request, monkeypatch):
+    """Mock the Planner Agent during workflow and API integration tests.
+
+    Ensures zero external LLM calls and fast offline execution unless
+    explicitly running test_planner.py.
+    """
+    from datetime import date, datetime, timedelta
+
+    filename = request.node.fspath.basename if hasattr(request.node, "fspath") else ""
+    if "test_planner" not in filename:
+        def fake_planner(
+            request: dict[str, Any],
+            research: Any = None,
+            feedback: Any = None,
+            modifications: Any = None,
+            revision_count: int = 0,
+            *args,
+            **kwargs,
+        ) -> dict[str, Any]:
+            dest = request.get("destination", "Rome, Italy")
+            currency = request.get("currency", "USD")
+            budget = float(request.get("total_trip_budget", 1000.0))
+            interests = request.get("interests", ["sightseeing"])
+
+            try:
+                s_dt = datetime.strptime(str(request["start_date"]), "%Y-%m-%d").date()
+                e_dt = datetime.strptime(str(request["end_date"]), "%Y-%m-%d").date()
+                n_days = max(1, (e_dt - s_dt).days + 1)
+            except Exception:
+                s_dt = date.today()
+                n_days = 4
+
+            target_budget = round(budget * 0.75, 2)
+            day_budget = round(target_budget / n_days, 2)
+
+            days = []
+            for d_idx in range(n_days):
+                curr_date = s_dt + timedelta(days=d_idx)
+                interest = interests[d_idx % len(interests)]
+
+                acts = [
+                    {
+                        "name": f"Morning {interest.title()} Tour",
+                        "description": f"Morning visit in {dest} focusing on {interest}.",
+                        "category": "attraction",
+                        "start_time": "09:00 AM",
+                        "estimated_duration": "3 hours",
+                        "estimated_cost": round(day_budget * 0.5, 2),
+                        "candidate_id": "attr-1",
+                        "source_url": "https://example.com/fushimi",
+                    },
+                    {
+                        "name": "Local Dining Experience",
+                        "description": "Lunch and culinary exploration in historic quarter.",
+                        "category": "dining",
+                        "start_time": "01:00 PM",
+                        "estimated_duration": "2 hours",
+                        "estimated_cost": round(day_budget * 0.3, 2),
+                        "candidate_id": None,
+                        "source_url": None,
+                    },
+                    {
+                        "name": "Evening Promenade",
+                        "description": "Leisure stroll and relaxation.",
+                        "category": "leisure",
+                        "start_time": "06:00 PM",
+                        "estimated_duration": "2 hours",
+                        "estimated_cost": round(day_budget - (round(day_budget * 0.5, 2) + round(day_budget * 0.3, 2)), 2),
+                        "candidate_id": None,
+                        "source_url": None,
+                    },
+                ]
+
+                if modifications:
+                    acts.append({
+                        "name": "Requested Modification",
+                        "description": f"Modification applied: {modifications}",
+                        "category": "leisure",
+                        "start_time": "08:00 PM",
+                        "estimated_duration": "1 hour",
+                        "estimated_cost": 0.0,
+                        "candidate_id": None,
+                        "source_url": None,
+                    })
+                elif feedback:
+                    acts.append({
+                        "name": "Feedback Adjustment",
+                        "description": f"Feedback addressed: {feedback}",
+                        "category": "leisure",
+                        "start_time": "08:00 PM",
+                        "estimated_duration": "1 hour",
+                        "estimated_cost": 0.0,
+                        "candidate_id": None,
+                        "source_url": None,
+                    })
+
+                days.append({
+                    "day": d_idx + 1,
+                    "date": curr_date.isoformat(),
+                    "focus": interest,
+                    "theme": interest,
+                    "activities": acts,
+                    "estimated_cost": day_budget,
+                })
+
+            summary = f"{n_days}-day itinerary in {dest} tailored for {', '.join(interests)}."
+            if revision_count > 0:
+                summary += f" (Revision {revision_count})"
+
+            return {
+                "destination": dest,
+                "total_days": n_days,
+                "currency": currency,
+                "total_estimated_cost": round(day_budget * n_days, 2),
+                "days": days,
+                "summary": summary,
+                "budget_breakdown": {
+                    "accommodation": round(target_budget * 0.35, 2),
+                    "food": round(target_budget * 0.25, 2),
+                    "activities": round(target_budget * 0.20, 2),
+                    "local_transportation": round(target_budget * 0.10, 2),
+                    "contingency": round(target_budget * 0.10, 2),
+                },
+                "assumptions": ["Pace is moderate"],
+                "warnings": [],
+            }
+
+        monkeypatch.setattr("app.graph.nodes.run_planner_agent", fake_planner)
+        monkeypatch.setattr("app.agents.planner.run_planner_agent", fake_planner)
+        monkeypatch.setattr("app.agents.planner.run_planner_placeholder", fake_planner)

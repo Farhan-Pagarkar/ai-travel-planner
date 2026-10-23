@@ -24,6 +24,7 @@ def create_plan(graph: Any, request: TravelRequest) -> dict[str, Any]:
         "workflow_stage": state.values.get("workflow_stage"),
         "draft_itinerary": state.values.get("draft_itinerary"),
         "validation_issues": state.values.get("validation_issues", []),
+        "research_results": state.values.get("research_results"),
     }
 
 
@@ -45,6 +46,7 @@ def get_plan(graph: Any, plan_id: str) -> dict[str, Any]:
         "revision_count": state.values.get("revision_count", 0),
         "draft_itinerary": state.values.get("draft_itinerary"),
         "validation_issues": state.values.get("validation_issues", []),
+        "research_results": state.values.get("research_results"),
     }
 
 
@@ -78,6 +80,7 @@ def review_plan(graph: Any, plan_id: str, review: HumanReviewInput) -> dict[str,
         "revision_count": updated_state.values.get("revision_count", 0),
         "draft_itinerary": updated_state.values.get("draft_itinerary"),
         "validation_issues": updated_state.values.get("validation_issues", []),
+        "research_results": updated_state.values.get("research_results"),
         "final_itinerary": updated_state.values.get("final_itinerary"),
     }
 
@@ -105,4 +108,5 @@ def get_final_plan(graph: Any, plan_id: str) -> dict[str, Any]:
         "plan_id": plan_id,
         "status": current_status,
         "final_itinerary": final_itinerary,
+        "research_results": state.values.get("research_results"),
     }

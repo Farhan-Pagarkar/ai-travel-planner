@@ -1,11 +1,65 @@
-"""Itinerary Planner Agent placeholder module.
-
-Constructs day-by-day itineraries with activity assignments and cost estimates.
-LLM and dynamic tool integrations will be added in subsequent phases.
-"""
+"""Itinerary Planner Agent module utilizing Groq, Activity Lookup Tool, and Budget Calculator Tool."""
 
 from datetime import date, datetime, timedelta
+import json
 from typing import Any, Optional
+from groq import Groq
+
+from app.config import get_groq_api_key, get_groq_model
+from app.schemas.itinerary import Itinerary
+from app.schemas.research import ResearchResult
+from app.tools.activities import ActivityCandidate, lookup_activity_candidates
+from app.tools.budget import calculate_budget_allocation
+
+PLANNER_SYSTEM_PROMPT = """You are an expert, meticulous travel itinerary planner.
+Your task is to construct a structured, day-by-day travel itinerary grounded strictly in the provided research, activity candidates, and budget constraints.
+
+CRITICAL GROUNDING AND VALIDATION RULES:
+1. Cover every single calendar date from start_date to end_date inclusively, in exact chronological order without gaps or duplicate dates.
+2. For all named attractions and upcoming events, you MUST select a candidate from the provided CANDIDATE ACTIVITIES list.
+3. For each selected candidate, copy its exact "id" into candidate_id and its exact "source_url" into source_url.
+4. NEVER invent attraction names, venue names, event dates, candidate IDs, or source URLs.
+5. Generic meals, rest periods, transit, and free-time blocks must have candidate_id: null and source_url: null. Do not invent restaurant names or claim generic activities are verified venues.
+6. The sum of all activity estimated_cost values for a day must equal that day's estimated_cost.
+7. The sum of all daily estimated_cost values must equal total_estimated_cost.
+8. total_estimated_cost must not exceed the total trip budget.
+9. All costs must be non-negative numbers.
+10. If candidate activities are limited, schedule leisure, free-time, or scenic walking blocks rather than inventing attractions. Note any limitations in warnings.
+11. If user feedback or requested modifications are provided, incorporate them into the plan while keeping unaffected days consistent.
+12. Return ONLY a single valid JSON object strictly matching the schema.
+
+SCHEMA SPECIFICATION:
+{
+  "destination": "string",
+  "total_days": 3,
+  "currency": "USD",
+  "total_estimated_cost": 750.0,
+  "days": [
+    {
+      "day": 1,
+      "date": "2026-11-01",
+      "focus": "string",
+      "theme": "string or null",
+      "activities": [
+        {
+          "name": "string",
+          "description": "string",
+          "category": "string",
+          "start_time": "string or null",
+          "estimated_duration": "string or null",
+          "estimated_cost": 25.0,
+          "candidate_id": "attr-1 or null",
+          "source_url": "https://... or null"
+        }
+      ],
+      "estimated_cost": 250.0
+    }
+  ],
+  "summary": "string",
+  "assumptions": ["string"],
+  "warnings": ["string"]
+}
+"""
 
 
 def _parse_date(date_val: Any) -> date:
@@ -14,67 +68,312 @@ def _parse_date(date_val: Any) -> date:
     return datetime.strptime(str(date_val), "%Y-%m-%d").date()
 
 
-def run_planner_placeholder(
+def _format_candidate_activities_prompt(candidates: list[ActivityCandidate]) -> str:
+    """Format candidate records into structured text for LLM grounding."""
+    if not candidates:
+        return "NO VERIFIED CANDIDATE ACTIVITIES AVAILABLE FROM RESEARCH. (Schedule leisure, free exploration, and scenic walks with candidate_id: null)."
+
+    lines = [f"Found {len(candidates)} verified candidate activities:"]
+    for c in candidates:
+        event_info = f" | Event Date: {c.event_date}" if c.event_date else ""
+        lines.append(
+            f"- [ID: {c.id}] Name: {c.name} | Type: {c.candidate_type} | Category: {c.category}{event_info}\n"
+            f"  Description: {c.description}\n"
+            f"  Source URL: {c.source_url}"
+        )
+    return "\n".join(lines)
+
+
+def _format_budget_prompt(budget_alloc: Any) -> str:
+    """Format budget breakdown and constraints for prompt."""
+    b = budget_alloc.to_dict()
+    breakdown_lines = [f"  - {cat}: {amount} {b['currency']}" for cat, amount in b["breakdown"].items()]
+    return (
+        f"TOTAL GROUP BUDGET: {b['total_budget']} {b['currency']}\n"
+        f"BUDGET PER TRAVELER: {b['budget_per_traveler']} {b['currency']} ({b['traveler_count']} traveler(s))\n"
+        f"DAILY GROUP BUDGET CAP: {b['budget_per_day']} {b['currency']} ({b['trip_days']} day(s))\n"
+        f"PLANNED EXPENSE ALLOWANCE (AFTER {b['contingency_reserve']} {b['currency']} CONTINGENCY): {b['available_for_planned_expenses']} {b['currency']}\n"
+        f"CATEGORY ALLOCATIONS (ESTIMATES):\n" + "\n".join(breakdown_lines) + "\n"
+        f"NOTE: {b['notes']}"
+    )
+
+
+def _validate_itinerary_grounding(
+    itinerary_data: dict[str, Any],
+    expected_dates: list[str],
+    max_budget: float,
+    valid_candidates: dict[str, ActivityCandidate],
+) -> list[str]:
+    """Perform deterministic grounding and math checks on synthesized itinerary.
+
+    Returns list of error messages, or empty list if valid.
+    """
+    errors: list[str] = []
+
+    # 1. Date coverage and order checks
+    days = itinerary_data.get("days", [])
+    if not isinstance(days, list) or len(days) != len(expected_dates):
+        errors.append(f"Itinerary day count mismatch: expected {len(expected_dates)} day(s), got {len(days) if isinstance(days, list) else 0}.")
+        return errors
+
+    actual_dates = [d.get("date") for d in days if isinstance(d, dict)]
+    if actual_dates != expected_dates:
+        errors.append(f"Itinerary dates {actual_dates} do not match expected chronological dates {expected_dates}.")
+
+    if len(set(actual_dates)) != len(actual_dates):
+        errors.append("Duplicate day dates detected in itinerary.")
+
+    # 2. Activity candidate grounding and URL preservation
+    for day in days:
+        if not isinstance(day, dict):
+            continue
+        day_num = day.get("day", "?")
+        activities = day.get("activities", [])
+        if not isinstance(activities, list):
+            errors.append(f"Day {day_num} activities must be a list.")
+            continue
+
+        for act in activities:
+            if not isinstance(act, dict):
+                continue
+            act_name = act.get("name", "Unnamed")
+            cand_id = act.get("candidate_id")
+            source_url = act.get("source_url")
+            cost = act.get("estimated_cost", 0.0)
+
+            if cost < 0:
+                errors.append(f"Activity '{act_name}' on Day {day_num} has negative cost ({cost}).")
+
+            if cand_id:
+                if cand_id not in valid_candidates:
+                    errors.append(
+                        f"Activity '{act_name}' on Day {day_num} references unknown candidate ID '{cand_id}'. Must select from provided candidate IDs."
+                    )
+                else:
+                    expected_url = valid_candidates[cand_id].source_url
+                    if source_url != expected_url:
+                        errors.append(
+                            f"Activity '{act_name}' on Day {day_num} has source URL '{source_url}' that does not match candidate '{cand_id}' URL '{expected_url}'."
+                        )
+            else:
+                if source_url:
+                    errors.append(
+                        f"Generic activity '{act_name}' on Day {day_num} provides a source URL without a verified candidate ID."
+                    )
+
+    # 3. Cost arithmetic checks
+    daily_cost_sum = 0.0
+    for day in days:
+        if not isinstance(day, dict):
+            continue
+        day_num = day.get("day", "?")
+        activities = day.get("activities", [])
+        act_cost_sum = round(sum(float(a.get("estimated_cost", 0.0)) for a in activities if isinstance(a, dict)), 2)
+        reported_day_cost = round(float(day.get("estimated_cost", 0.0)), 2)
+
+        if abs(act_cost_sum - reported_day_cost) > 0.05:
+            errors.append(
+                f"Day {day_num} activity costs sum to {act_cost_sum}, which does not match reported day estimated_cost {reported_day_cost}."
+            )
+        daily_cost_sum = round(daily_cost_sum + reported_day_cost, 2)
+
+    total_reported_cost = round(float(itinerary_data.get("total_estimated_cost", 0.0)), 2)
+    if abs(daily_cost_sum - total_reported_cost) > 0.05:
+        errors.append(
+            f"Total estimated cost ({total_reported_cost}) does not match sum of daily costs ({daily_cost_sum})."
+        )
+
+    if total_reported_cost > max_budget:
+        errors.append(
+            f"Total estimated cost ({total_reported_cost}) exceeds total trip budget ({max_budget})."
+        )
+
+    return errors
+
+
+def run_planner_agent(
     request: dict[str, Any],
     research: Optional[dict[str, Any]] = None,
     feedback: Optional[str] = None,
     modifications: Optional[str] = None,
     revision_count: int = 0,
+    groq_client: Optional[Groq] = None,
+    groq_model: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Generate a structured day-by-day itinerary covering requested dates.
-
-    NOTE: LLM generation and live activity pricing tools will be added later.
-    """
-    destination = request.get("destination", "Destination")
+    """Synthesize a complete, research-grounded day-by-day itinerary."""
+    destination = str(request.get("destination", "")).strip()
+    start_date_str = str(request.get("start_date", "")).strip()
+    end_date_str = str(request.get("end_date", "")).strip()
     interests = request.get("interests", ["sightseeing"])
-    currency = request.get("currency", "USD")
+    currency = str(request.get("currency", "USD")).strip().upper()
     total_budget = float(request.get("total_trip_budget", 1000.0))
+    traveler_count = int(request.get("traveler_count", 1))
 
+    if not destination:
+        raise ValueError("Travel request missing required 'destination'.")
+    if not start_date_str or not end_date_str:
+        raise ValueError("Travel request missing travel dates.")
+
+    start_dt = _parse_date(start_date_str)
+    end_dt = _parse_date(end_date_str)
+    if end_dt < start_dt:
+        raise ValueError(f"Trip end_date {end_date_str} cannot precede start_date {start_date_str}.")
+
+    # 1. Build expected chronological dates list
+    expected_dates: list[str] = []
+    curr = start_dt
+    while curr <= end_dt:
+        expected_dates.append(curr.isoformat())
+        curr += timedelta(days=1)
+    num_days = len(expected_dates)
+
+    # 2. Normalize and validate research data
+    normalized_research: dict[str, Any] = {}
+    if research and isinstance(research, dict):
+        try:
+            validated_res = ResearchResult.model_validate(research)
+            normalized_research = validated_res.model_dump(mode="json")
+        except Exception:
+            normalized_research = research
+
+    # 3. Call Tool 1: Activity Lookup Tool
+    activity_lookup = lookup_activity_candidates(
+        research_data=normalized_research,
+        interests=interests,
+        limit=20,
+        min_required=num_days,
+    )
+    valid_candidates = {c.id: c for c in activity_lookup.candidates}
+
+    # 4. Call Tool 2: Budget Calculator Tool
+    budget_allocation = calculate_budget_allocation(
+        total_trip_budget=total_budget,
+        currency=currency,
+        traveler_count=traveler_count,
+        trip_days=num_days,
+    )
+
+    # 5. Initialize Groq client
+    if groq_client is None:
+        groq_api_key = get_groq_api_key()
+        groq_client = Groq(api_key=groq_api_key)
+
+    if groq_model is None:
+        groq_model = get_groq_model()
+
+    # 6. Build LLM prompt
+    candidates_text = _format_candidate_activities_prompt(activity_lookup.candidates)
+    budget_text = _format_budget_prompt(budget_allocation)
+
+    revision_context = ""
+    if modifications:
+        revision_context = f"\nUSER REQUESTED MODIFICATIONS (Revision {revision_count}):\n{modifications}\nApply these changes while preserving unaffected days."
+    elif feedback:
+        revision_context = f"\nUSER REVIEW FEEDBACK (Revision {revision_count}):\n{feedback}\nAddress this feedback while keeping unaffected days consistent."
+
+    weather_notes = ""
+    if normalized_research.get("weather"):
+        weather_notes = f"\nDESTINATION WEATHER: {normalized_research['weather'].get('notes', 'Normal conditions.')}"
+
+    user_prompt = (
+        f"Create a {num_days}-day itinerary for {destination} from {start_date_str} to {end_date_str}.\n\n"
+        f"TRAVEL DATES REQUIRED ({num_days} days): {', '.join(expected_dates)}\n"
+        f"TRAVELER INTERESTS: {', '.join(interests)}\n"
+        f"{weather_notes}\n\n"
+        f"--- BUDGET CONSTRAINTS ---\n{budget_text}\n\n"
+        f"--- CANDIDATE ACTIVITIES (SELECT FROM THESE) ---\n{candidates_text}\n"
+        f"{revision_context}\n\n"
+        "Generate strictly valid JSON conforming to the schema. "
+        "Use candidate_id and exact source_url for all researched attractions/events. "
+        "Use candidate_id: null and source_url: null for generic meals and free time. "
+        "Ensure daily costs sum to total_estimated_cost and do not exceed total group budget."
+    )
+
+    messages = [
+        {"role": "system", "content": PLANNER_SYSTEM_PROMPT},
+        {"role": "user", "content": user_prompt},
+    ]
+
+    # Attempt 1: Generation
     try:
-        start_dt = _parse_date(request["start_date"])
-        end_dt = _parse_date(request["end_date"])
-        num_days = max(1, (end_dt - start_dt).days + 1)
-    except Exception:
-        start_dt = date.today()
-        num_days = 3
+        completion = groq_client.chat.completions.create(
+            model=groq_model,
+            messages=messages,
+            response_format={"type": "json_object"},
+            max_tokens=4096,
+            temperature=0.2,
+        )
+        content = completion.choices[0].message.content or "{}"
+        parsed_itinerary = json.loads(content)
+    except Exception as exc:
+        raise RuntimeError(f"Groq itinerary generation failed: {exc}") from None
 
-    # Plan costs safely within 75% of budget to satisfy validation checks
-    budget_target = round(total_budget * 0.75, 2)
-    daily_budget = round(budget_target / num_days, 2)
+    # Deterministic grounding verification
+    errors = _validate_itinerary_grounding(
+        itinerary_data=parsed_itinerary,
+        expected_dates=expected_dates,
+        max_budget=total_budget,
+        valid_candidates=valid_candidates,
+    )
 
-    days: list[dict[str, Any]] = []
-    for day_idx in range(num_days):
-        current_date = start_dt + timedelta(days=day_idx)
-        interest = interests[day_idx % len(interests)]
-        activities = [
-            f"Morning: Visit top {destination} landmark focused on {interest}",
-            f"Afternoon: Explore local culinary highlights and historic markets",
-            f"Evening: Leisure stroll and dinner in central {destination}",
-        ]
+    # Attempt 2: Bounded single correction attempt if validation failed
+    if errors:
+        correction_prompt = (
+            f"Your previous itinerary output had the following validation errors:\n"
+            + "\n".join(f"- {e}" for e in errors)
+            + "\n\nPlease correct these errors and regenerate the complete, strictly valid JSON itinerary. "
+            "Ensure exact dates, valid candidate IDs and URLs, and exact cost math."
+        )
+        messages.append({"role": "assistant", "content": content})
+        messages.append({"role": "user", "content": correction_prompt})
 
-        if modifications:
-            activities.append(f"Modification applied: {modifications}")
-        elif feedback:
-            activities.append(f"Feedback addressed: {feedback}")
+        try:
+            correction_completion = groq_client.chat.completions.create(
+                model=groq_model,
+                messages=messages,
+                response_format={"type": "json_object"},
+                max_tokens=4096,
+                temperature=0.1,
+            )
+            content = correction_completion.choices[0].message.content or "{}"
+            parsed_itinerary = json.loads(content)
+        except Exception as exc:
+            raise RuntimeError(f"Groq itinerary correction attempt failed: {exc}") from None
 
-        days.append({
-            "day": day_idx + 1,
-            "date": current_date.isoformat(),
-            "focus": interest,
-            "activities": activities,
-            "estimated_cost": daily_budget,
-        })
+        # Re-validate after correction attempt
+        errors = _validate_itinerary_grounding(
+            itinerary_data=parsed_itinerary,
+            expected_dates=expected_dates,
+            max_budget=total_budget,
+            valid_candidates=valid_candidates,
+        )
+        if errors:
+            raise RuntimeError(
+                f"Itinerary planning failed validation after correction attempt: {'; '.join(errors)}"
+            )
 
-    total_estimated_cost = round(daily_budget * num_days, 2)
-    summary = f"{num_days}-day itinerary in {destination} tailored for {', '.join(interests)}."
-    if revision_count > 0:
-        summary += f" (Revision {revision_count})"
+    # 7. Post-process itinerary metadata
+    parsed_itinerary["destination"] = destination
+    parsed_itinerary["total_days"] = num_days
+    parsed_itinerary["currency"] = currency
+    parsed_itinerary["budget_breakdown"] = budget_allocation.to_dict()
 
-    return {
-        "destination": destination,
-        "total_days": num_days,
-        "currency": currency,
-        "total_estimated_cost": total_estimated_cost,
-        "days": days,
-        "summary": summary,
-    }
+    if revision_count > 0 and "Revision" not in parsed_itinerary.get("summary", ""):
+        parsed_itinerary["summary"] = f"{parsed_itinerary.get('summary', '')} (Revision {revision_count})"
+
+    if not activity_lookup.is_sufficient and activity_lookup.notes:
+        warnings_list = parsed_itinerary.setdefault("warnings", [])
+        if activity_lookup.notes not in warnings_list:
+            warnings_list.append(activity_lookup.notes)
+
+    # 8. Final Pydantic validation
+    try:
+        validated = Itinerary.model_validate(parsed_itinerary)
+    except Exception as exc:
+        raise RuntimeError(f"Itinerary schema validation failed: {exc}") from None
+
+    return validated.model_dump(mode="json")
+
+
+# Backwards compatibility alias
+run_planner_placeholder = run_planner_agent

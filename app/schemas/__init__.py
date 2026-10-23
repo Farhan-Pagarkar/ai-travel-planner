@@ -1,5 +1,6 @@
 """Pydantic schemas for data validation and transfer."""
 
+from app.schemas.itinerary import Itinerary, ItineraryDay, ScheduledActivity
 from app.schemas.request import TravelRequest
 from app.schemas.research import (
     AttractionInfo,
@@ -23,4 +24,7 @@ __all__ = [
     "DailyWeatherForecast",
     "HistoricalWeatherComparison",
     "WeatherContext",
+    "Itinerary",
+    "ItineraryDay",
+    "ScheduledActivity",
 ]
