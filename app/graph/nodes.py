@@ -5,7 +5,7 @@ from langgraph.types import interrupt
 
 from app.agents.itinerary_validator import run_validator_placeholder
 from app.agents.planner import run_planner_placeholder
-from app.agents.researcher import run_researcher_placeholder
+from app.agents.researcher import run_researcher_agent
 from app.graph.state import TravelPlanState
 from app.schemas.request import TravelRequest
 from app.schemas.review import HumanReviewInput
@@ -34,7 +34,7 @@ def validate_request(state: TravelPlanState) -> dict[str, Any]:
 def research_agent(state: TravelPlanState) -> dict[str, Any]:
     """Collect destination information, weather, and top attractions."""
     request = state["request"]
-    research = run_researcher_placeholder(request)
+    research = run_researcher_agent(request)
     return {
         "research_results": research,
         "status": "researched",
