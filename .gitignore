@@ -1,0 +1,50 @@
+# Python bytecode and cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# SQLite databases
+*.sqlite
+*.sqlite3
+*.db
+data/*.sqlite
+data/*.sqlite3
+data/*.db
+!data/.gitkeep
+!static/.gitkeep
+
+# Pytest and coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Editor and IDE metadata
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Operating System files
+.DS_Store
+Thumbs.db
+
+# Documentation / Assignment files
+*.pdf
+
+# Credentials & secrets
+*.pem
+*.key
+*.cert
+
