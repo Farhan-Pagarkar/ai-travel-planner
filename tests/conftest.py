@@ -231,3 +231,18 @@ def mock_planner_in_workflow_tests(request, monkeypatch):
         monkeypatch.setattr("app.graph.nodes.run_planner_agent", fake_planner)
         monkeypatch.setattr("app.agents.planner.run_planner_agent", fake_planner)
         monkeypatch.setattr("app.agents.planner.run_planner_placeholder", fake_planner)
+
+
+@pytest.fixture(autouse=True)
+def mock_validator_groq_in_workflow_tests(request, monkeypatch):
+    """Ensure validator does not make external Groq calls in API and workflow tests.
+
+    Allows deterministic validation checks to run fully while keeping test execution
+    fast, deterministic, and completely offline without credit consumption.
+    """
+    filename = request.node.fspath.basename if hasattr(request.node, "fspath") else ""
+    if "test_validator" not in filename:
+        monkeypatch.setattr(
+            "app.agents.itinerary_validator._run_groq_quality_review",
+            lambda *args, **kwargs: [],
+        )

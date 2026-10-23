@@ -587,6 +587,60 @@ def test_itinerary_grounding_validation_detects_errors():
     )
     assert any("does not match candidate" in e for e in errs_url)
 
+    # 6. Researched attraction category without candidate ID is rejected
+    errs_attr_no_id = _validate_itinerary_grounding(
+        itinerary_data={
+            "total_estimated_cost": 50.0,
+            "days": [
+                {
+                    "day": 1,
+                    "date": "2026-11-01",
+                    "activities": [
+                        {
+                            "name": "Kyoto Temple",
+                            "category": "attraction",
+                            "estimated_cost": 50.0,
+                            "candidate_id": None,
+                            "source_url": None,
+                        }
+                    ],
+                    "estimated_cost": 50.0,
+                }
+            ],
+        },
+        expected_dates=["2026-11-01"],
+        max_budget=500.0,
+        valid_candidates=valid_candidates,
+    )
+    assert any("classified as an attraction/event" in e for e in errs_attr_no_id)
+
+    # 7. Malformed or non-finite cost handled safely without raising TypeError
+    errs_malformed_cost = _validate_itinerary_grounding(
+        itinerary_data={
+            "total_estimated_cost": float("nan"),
+            "days": [
+                {
+                    "day": 1,
+                    "date": "2026-11-01",
+                    "activities": [
+                        {
+                            "name": "Walking Tour",
+                            "category": "leisure",
+                            "estimated_cost": "free",
+                            "candidate_id": None,
+                            "source_url": None,
+                        }
+                    ],
+                    "estimated_cost": None,
+                }
+            ],
+        },
+        expected_dates=["2026-11-01"],
+        max_budget=500.0,
+        valid_candidates=valid_candidates,
+    )
+    assert any("invalid cost" in e for e in errs_malformed_cost)
+
 
 def test_insufficient_research_does_not_fabricate_attractions():
     """When research is empty, candidate prompt instructs free exploration without crashing."""

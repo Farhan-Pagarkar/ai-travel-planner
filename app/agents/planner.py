@@ -2,6 +2,7 @@
 
 from datetime import date, datetime, timedelta
 import json
+import math
 from typing import Any, Optional
 from groq import Groq
 
@@ -10,6 +11,19 @@ from app.schemas.itinerary import Itinerary
 from app.schemas.research import ResearchResult
 from app.tools.activities import ActivityCandidate, lookup_activity_candidates
 from app.tools.budget import calculate_budget_allocation
+
+
+def _parse_safe_float(val: Any) -> Optional[float]:
+    """Parse a float safely, rejecting None, non-numbers, NaN, and infinity."""
+    if val is None:
+        return None
+    try:
+        f = float(val)
+        if math.isnan(f) or math.isinf(f):
+            return None
+        return f
+    except (ValueError, TypeError):
+        return None
 
 PLANNER_SYSTEM_PROMPT = """You are an expert, meticulous travel itinerary planner.
 Your task is to construct a structured, day-by-day travel itinerary grounded strictly in the provided research, activity candidates, and budget constraints.
@@ -110,6 +124,9 @@ def _validate_itinerary_grounding(
     """
     errors: list[str] = []
 
+    if not isinstance(itinerary_data, dict):
+        return ["Itinerary data must be a JSON object."]
+
     # 1. Date coverage and order checks
     days = itinerary_data.get("days", [])
     if not isinstance(days, list) or len(days) != len(expected_dates):
@@ -123,9 +140,20 @@ def _validate_itinerary_grounding(
     if len(set(actual_dates)) != len(actual_dates):
         errors.append("Duplicate day dates detected in itinerary.")
 
+    GENERIC_CATEGORIES = {
+        "meal", "dining", "food", "lunch", "dinner", "breakfast",
+        "leisure", "transit", "transportation", "travel", "rest",
+        "free_time", "relaxation", "scenic_walk", "walk"
+    }
+    ATTRACTION_EVENT_CATEGORIES = {
+        "attraction", "event", "upcoming_event", "sightseeing",
+        "cultural_event", "festival", "monument", "museum", "temple", "shrine", "tour"
+    }
+
     # 2. Activity candidate grounding and URL preservation
     for day in days:
         if not isinstance(day, dict):
+            errors.append("Encountered non-dictionary day entry in itinerary.")
             continue
         day_num = day.get("day", "?")
         activities = day.get("activities", [])
@@ -135,14 +163,26 @@ def _validate_itinerary_grounding(
 
         for act in activities:
             if not isinstance(act, dict):
+                errors.append(f"Day {day_num} contains a non-dictionary activity.")
                 continue
-            act_name = act.get("name", "Unnamed")
+            act_name = str(act.get("name", "Unnamed")).strip()
             cand_id = act.get("candidate_id")
+            if cand_id is not None:
+                cand_id = str(cand_id).strip()
+                if not cand_id:
+                    cand_id = None
             source_url = act.get("source_url")
-            cost = act.get("estimated_cost", 0.0)
+            if source_url is not None:
+                source_url = str(source_url).strip()
+                if not source_url:
+                    source_url = None
 
-            if cost < 0:
-                errors.append(f"Activity '{act_name}' on Day {day_num} has negative cost ({cost}).")
+            raw_cost = act.get("estimated_cost", 0.0)
+            parsed_cost = _parse_safe_float(raw_cost)
+            if parsed_cost is None or parsed_cost < 0:
+                errors.append(f"Activity '{act_name}' on Day {day_num} has invalid cost ({raw_cost}). Must be a finite, non-negative number.")
+
+            category = str(act.get("category", "")).lower().strip()
 
             if cand_id:
                 if cand_id not in valid_candidates:
@@ -160,6 +200,16 @@ def _validate_itinerary_grounding(
                     errors.append(
                         f"Generic activity '{act_name}' on Day {day_num} provides a source URL without a verified candidate ID."
                     )
+                is_attraction_or_event = (
+                    category in ATTRACTION_EVENT_CATEGORIES
+                    or category.startswith("attraction")
+                    or category.startswith("event")
+                    or act.get("candidate_type") in {"attraction", "upcoming_event"}
+                )
+                if is_attraction_or_event and category not in GENERIC_CATEGORIES:
+                    errors.append(
+                        f"Activity '{act_name}' on Day {day_num} is classified as an attraction/event ({category}) but is missing a verified candidate ID and source URL."
+                    )
 
     # 3. Cost arithmetic checks
     daily_cost_sum = 0.0
@@ -168,24 +218,44 @@ def _validate_itinerary_grounding(
             continue
         day_num = day.get("day", "?")
         activities = day.get("activities", [])
-        act_cost_sum = round(sum(float(a.get("estimated_cost", 0.0)) for a in activities if isinstance(a, dict)), 2)
-        reported_day_cost = round(float(day.get("estimated_cost", 0.0)), 2)
+        act_cost_sum = 0.0
+        if isinstance(activities, list):
+            for a in activities:
+                if isinstance(a, dict):
+                    c = _parse_safe_float(a.get("estimated_cost", 0.0))
+                    if c is not None and c >= 0:
+                        act_cost_sum = round(act_cost_sum + round(c, 2), 2)
 
-        if abs(act_cost_sum - reported_day_cost) > 0.05:
+        raw_day_cost = day.get("estimated_cost", 0.0)
+        parsed_day_cost = _parse_safe_float(raw_day_cost)
+        if parsed_day_cost is None or parsed_day_cost < 0:
+            errors.append(f"Day {day_num} has invalid estimated_cost ({raw_day_cost}).")
+            parsed_day_cost = 0.0
+        else:
+            parsed_day_cost = round(parsed_day_cost, 2)
+
+        if abs(act_cost_sum - parsed_day_cost) > 0.05:
             errors.append(
-                f"Day {day_num} activity costs sum to {act_cost_sum}, which does not match reported day estimated_cost {reported_day_cost}."
+                f"Day {day_num} activity costs sum to {act_cost_sum}, which does not match reported day estimated_cost {parsed_day_cost}."
             )
-        daily_cost_sum = round(daily_cost_sum + reported_day_cost, 2)
+        daily_cost_sum = round(daily_cost_sum + parsed_day_cost, 2)
 
-    total_reported_cost = round(float(itinerary_data.get("total_estimated_cost", 0.0)), 2)
-    if abs(daily_cost_sum - total_reported_cost) > 0.05:
+    raw_total_cost = itinerary_data.get("total_estimated_cost", 0.0)
+    parsed_total_cost = _parse_safe_float(raw_total_cost)
+    if parsed_total_cost is None or parsed_total_cost < 0:
+        errors.append(f"Total estimated cost has invalid value ({raw_total_cost}).")
+        parsed_total_cost = 0.0
+    else:
+        parsed_total_cost = round(parsed_total_cost, 2)
+
+    if abs(daily_cost_sum - parsed_total_cost) > 0.05:
         errors.append(
-            f"Total estimated cost ({total_reported_cost}) does not match sum of daily costs ({daily_cost_sum})."
+            f"Total estimated cost ({parsed_total_cost}) does not match sum of daily costs ({daily_cost_sum})."
         )
 
-    if total_reported_cost > max_budget:
+    if parsed_total_cost > max_budget:
         errors.append(
-            f"Total estimated cost ({total_reported_cost}) exceeds total trip budget ({max_budget})."
+            f"Total estimated cost ({parsed_total_cost}) exceeds total trip budget ({max_budget})."
         )
 
     return errors

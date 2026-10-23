@@ -3,7 +3,7 @@
 from typing import Any
 from langgraph.types import interrupt
 
-from app.agents.itinerary_validator import run_validator_placeholder
+from app.agents.itinerary_validator import run_itinerary_validator
 from app.agents.planner import run_planner_agent
 from app.agents.researcher import run_researcher_agent
 from app.graph.state import TravelPlanState
@@ -62,7 +62,12 @@ def itinerary_validator(state: TravelPlanState) -> dict[str, Any]:
     """Validate itinerary constraints, dates, and budget adherence."""
     request = state["request"]
     draft = state.get("draft_itinerary")
-    issues = run_validator_placeholder(request, draft)
+    research = state.get("research_results")
+    issues = run_itinerary_validator(
+        request=request,
+        draft_itinerary=draft,
+        research=research,
+    )
     return {
         "validation_issues": issues,
         "status": "validated_itinerary",
