@@ -195,9 +195,9 @@ class WeatherClient:
         last_year_details: Optional[str] = None
 
         for offset in range(1, years_back + 1):
-            prior_year = current_year - offset
-            hist_start = _get_equivalent_date(start_date, prior_year)
-            hist_end = _get_equivalent_date(end_date, prior_year)
+            prior_year = start_date.year - offset
+            hist_start = _get_equivalent_date(start_date, start_date.year - offset)
+            hist_end = _get_equivalent_date(end_date, end_date.year - offset)
 
             params = {
                 "latitude": lat,
@@ -240,8 +240,13 @@ class WeatherClient:
                     last_year_dates_str = f"{hist_start.isoformat()} to {hist_end.isoformat()}"
                     avg_max_last = round(sum(maxs) / len(maxs), 1)
                     avg_min_last = round(sum(mins) / len(mins), 1)
+                    year_label = (
+                        f"{hist_start.year}-{hist_end.year}"
+                        if hist_start.year != hist_end.year
+                        else f"{hist_start.year}"
+                    )
                     last_year_details = (
-                        f"Last year ({prior_year}): highs averaged {avg_max_last}°C, "
+                        f"Last year ({year_label}): highs averaged {avg_max_last}°C, "
                         f"lows averaged {avg_min_last}°C, total rainfall was {round(year_precip, 1)}mm."
                     )
 
@@ -346,8 +351,20 @@ def gather_weather_intelligence(
         )
 
     # Scenario 3: Hybrid (partial forecast overlap)
+    # Forecast covers dates within horizon; historical comparison covers ONLY dates beyond horizon
     forecast_days = client.get_forecast(coords.latitude, coords.longitude, coords.timezone, forecast_eligible_dates)
-    hist_comp = client.get_historical_comparison(coords.latitude, coords.longitude, coords.timezone, start_dt, end_dt)
+    
+    covered_dates = sorted(list(forecast_eligible_dates))
+    beyond_dates = sorted(beyond_forecast_dates)
+    hist_start_dt = beyond_dates[0]
+    hist_end_dt = beyond_dates[-1]
+
+    hist_comp = client.get_historical_comparison(
+        coords.latitude, coords.longitude, coords.timezone, hist_start_dt, hist_end_dt
+    )
+
+    forecast_range_str = f"{covered_dates[0]} to {covered_dates[-1]}" if covered_dates else "none"
+    hist_range_str = f"{hist_start_dt.isoformat()} to {hist_end_dt.isoformat()}"
 
     return coords, WeatherContext(
         weather_type="hybrid",
@@ -355,7 +372,7 @@ def gather_weather_intelligence(
         historical_comparison=hist_comp,
         notes=(
             f"Trip partially overlaps the 16-day forecast window. "
-            f"Live forecast is provided for {len(forecast_days)} day(s); "
-            f"historical climate comparisons are provided for the remaining dates beyond the forecast horizon."
+            f"Live forecast data is provided for {forecast_range_str} ({len(forecast_days)} day(s)); "
+            f"historical climate comparisons are provided for the remaining dates beyond the forecast horizon from {hist_range_str}."
         ),
     )

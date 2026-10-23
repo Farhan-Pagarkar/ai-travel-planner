@@ -426,7 +426,9 @@ def test_groq_missing_api_key(monkeypatch):
 def test_groq_invalid_output_handling():
     """Test handling when Groq returns invalid JSON."""
     mock_serper = MagicMock(spec=SerperClient)
-    mock_serper.search.return_value = []
+    mock_serper.search.return_value = [
+        SearchResultItem(title="Kyoto Guide", url="https://example.com/kyoto", snippet="Guide info")
+    ]
 
     mock_weather = MagicMock(spec=WeatherClient)
     mock_weather.geocode_destination.return_value = None
@@ -528,8 +530,9 @@ def test_research_agent_source_provenance_and_separation():
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.live
 def test_live_research_smoke_test():
-    """Optional live smoke test running real Serper, Open-Meteo, and Groq requests.
+    """Live integration smoke test running real Serper, Open-Meteo, and Groq requests.
 
     Skipped if valid SERPER_API_KEY and GROQ_API_KEY are not present in environment.
     """
@@ -553,3 +556,398 @@ def test_live_research_smoke_test():
     assert "weather" in result
     assert "source_urls" in result
     assert len(result["source_urls"]) > 0
+
+
+# ---------------------------------------------------------------------------
+# 5. Weather Edge Cases: Cross-Year, Leap-Day, and Hybrid Window Range Tests
+# ---------------------------------------------------------------------------
+
+
+def test_weather_historical_cross_year_dates(monkeypatch):
+    """Test historical date shifting across calendar year boundaries (e.g. Dec 30 to Jan 2)."""
+    captured_params = []
+
+    def mock_get(self, url, params=None, *args, **kwargs):
+        req = httpx.Request("GET", url)
+        if "archive" in url and params:
+            captured_params.append(dict(params))
+            mock_data = {
+                "daily": {
+                    "temperature_2m_max": [10.0, 9.5, 11.0, 10.5],
+                    "temperature_2m_min": [2.0, 1.5, 3.0, 2.5],
+                    "precipitation_sum": [0.0, 1.0, 0.0, 0.0],
+                }
+            }
+            return httpx.Response(status_code=200, json=mock_data, request=req)
+        return httpx.Response(status_code=404, request=req)
+
+    monkeypatch.setattr(httpx.Client, "get", mock_get)
+
+    client = WeatherClient()
+    start_dt = date(2026, 12, 30)
+    end_dt = date(2027, 1, 2)
+
+    hist_comp = client.get_historical_comparison(
+        lat=35.0, lon=135.7, tz="Asia/Tokyo", start_date=start_dt, end_date=end_dt, years_back=2
+    )
+
+    assert hist_comp is not None
+    assert len(captured_params) == 2
+    # Offset 1 (prior year): Dec 30, 2025 to Jan 2, 2026
+    assert captured_params[0]["start_date"] == "2025-12-30"
+    assert captured_params[0]["end_date"] == "2026-01-02"
+    # Offset 2: Dec 30, 2024 to Jan 2, 2025
+    assert captured_params[1]["start_date"] == "2024-12-30"
+    assert captured_params[1]["end_date"] == "2025-01-02"
+    # Verify equivalent dates string preserves cross-year boundary
+    assert hist_comp.equivalent_dates_last_year == "2025-12-30 to 2026-01-02"
+    assert "2025-2026" in hist_comp.summary
+
+
+def test_weather_historical_leap_day_dates(monkeypatch):
+    """Test historical date shifting when start or end date is February 29 shifted to non-leap years."""
+    captured_params = []
+
+    def mock_get(self, url, params=None, *args, **kwargs):
+        req = httpx.Request("GET", url)
+        if "archive" in url and params:
+            captured_params.append(dict(params))
+            mock_data = {
+                "daily": {
+                    "temperature_2m_max": [12.0, 13.0],
+                    "temperature_2m_min": [4.0, 5.0],
+                    "precipitation_sum": [0.0, 0.5],
+                }
+            }
+            return httpx.Response(status_code=200, json=mock_data, request=req)
+        return httpx.Response(status_code=404, request=req)
+
+    monkeypatch.setattr(httpx.Client, "get", mock_get)
+
+    client = WeatherClient()
+    # 2028 is a leap year; trip includes Feb 29
+    start_dt = date(2028, 2, 28)
+    end_dt = date(2028, 3, 1)
+
+    hist_comp = client.get_historical_comparison(
+        lat=48.8, lon=2.3, tz="Europe/Paris", start_date=start_dt, end_date=end_dt, years_back=1
+    )
+
+    assert hist_comp is not None
+    assert len(captured_params) == 1
+    # 2027 is not a leap year; Feb 28 remains Feb 28, March 1 remains March 1
+    assert captured_params[0]["start_date"] == "2027-02-28"
+    assert captured_params[0]["end_date"] == "2027-03-01"
+
+    # Now test starting directly on leap day (Feb 29, 2028)
+    captured_params.clear()
+    hist_comp_feb29 = client.get_historical_comparison(
+        lat=48.8, lon=2.3, tz="Europe/Paris", start_date=date(2028, 2, 29), end_date=date(2028, 3, 2), years_back=1
+    )
+    assert hist_comp_feb29 is not None
+    assert captured_params[0]["start_date"] == "2027-02-28"
+    assert captured_params[0]["end_date"] == "2027-03-02"
+
+
+def test_weather_hybrid_window_ranges():
+    """Verify that hybrid weather windows query historical comparisons ONLY for dates beyond the 16-day horizon."""
+    mock_client = MagicMock(spec=WeatherClient)
+    from app.schemas.research import DestinationCoordinates, HistoricalWeatherComparison
+    mock_coords = DestinationCoordinates(latitude=35.6, longitude=139.6, resolved_name="Tokyo, Japan", timezone="Asia/Tokyo")
+    mock_client.geocode_destination.return_value = mock_coords
+    mock_client.get_forecast.return_value = []
+    mock_client.get_historical_comparison.return_value = HistoricalWeatherComparison(
+        comparison_years=[2025, 2024],
+        summary="Historical summary for Tokyo.",
+    )
+
+    # Reference today: 2026-10-01. Forecast horizon is 2026-10-01 to 2026-10-16.
+    # Trip: 2026-10-14 to 2026-10-19.
+    # Covered by forecast: 2026-10-14, 2026-10-15, 2026-10-16.
+    # Beyond forecast horizon: 2026-10-17 to 2026-10-19.
+    coords, weather = gather_weather_intelligence(
+        destination="Tokyo",
+        start_date_str="2026-10-14",
+        end_date_str="2026-10-19",
+        client=mock_client,
+        reference_today=date(2026, 10, 1),
+    )
+
+    assert weather.weather_type == "hybrid"
+    # Verify get_historical_comparison was called with ONLY dates beyond the horizon (2026-10-17 to 2026-10-19)
+    mock_client.get_historical_comparison.assert_called_once_with(
+        35.6, 139.6, "Asia/Tokyo", date(2026, 10, 17), date(2026, 10, 19)
+    )
+    # Verify notes accurately describe both forecast and historical ranges
+    assert "2026-10-14 to 2026-10-16" in weather.notes
+    assert "2026-10-17 to 2026-10-19" in weather.notes
+
+
+# ---------------------------------------------------------------------------
+# 6. Structured Weather Context & LLM Evidence Grounding Tests
+# ---------------------------------------------------------------------------
+
+
+def test_weather_data_present_in_llm_evidence():
+    """Verify that detailed forecast observations and historical comparison figures are in LLM prompt evidence."""
+    from app.schemas.research import DailyWeatherForecast, HistoricalWeatherComparison, WeatherContext
+    from app.agents.researcher import _format_evidence_package
+
+    forecast = [
+        DailyWeatherForecast(
+            date="2026-10-15",
+            temp_max_c=22.4,
+            temp_min_c=14.1,
+            precipitation_sum_mm=3.2,
+            precipitation_probability_pct=75.0,
+            weather_condition="Moderate rain",
+        )
+    ]
+    historical = HistoricalWeatherComparison(
+        comparison_years=[2025, 2024],
+        equivalent_dates_last_year="2025-10-15 to 2025-10-18",
+        typical_temp_max_c=21.0,
+        typical_temp_min_c=13.5,
+        typical_precipitation_mm=5.5,
+        rainy_days_count=1,
+        summary="Typical October conditions with mild temperatures.",
+    )
+    weather_ctx = WeatherContext(
+        weather_type="hybrid",
+        forecast_days=forecast,
+        historical_comparison=historical,
+        notes="Hybrid weather context.",
+    )
+
+    search_evidence = {
+        "destination_info": [SearchResultItem(title="Tokyo Tower", url="https://example.com/tokyo", snippet="Landmark")]
+    }
+
+    evidence_text = _format_evidence_package(
+        destination="Tokyo",
+        start_date="2026-10-15",
+        end_date="2026-10-18",
+        interests=["culture"],
+        search_data=search_evidence,
+        weather_context=weather_ctx,
+    )
+
+    # Check that daily forecast values are present
+    assert "22.4°C" in evidence_text
+    assert "14.1°C" in evidence_text
+    assert "3.2mm" in evidence_text
+    assert "Moderate rain" in evidence_text
+    assert "75.0%" in evidence_text
+    # Check that historical comparison figures are present
+    assert "21.0°C" in evidence_text
+    assert "13.5°C" in evidence_text
+    assert "5.5mm" in evidence_text
+    assert "[2025, 2024]" in evidence_text
+    assert "Typical October conditions" in evidence_text
+
+
+# ---------------------------------------------------------------------------
+# 7. Source Provenance & URL Grounding Tests
+# ---------------------------------------------------------------------------
+
+
+def test_source_provenance_validation_removes_fabricated_urls():
+    """Verify source provenance validation removes fabricated URLs, retains genuine URLs, and handles missing URLs."""
+    import json
+    mock_serper = MagicMock(spec=SerperClient)
+    # Search tool returns 2 genuine URLs
+    genuine_url_1 = "https://example.com/kyoto-temple"
+    genuine_url_2 = "https://example.com/kyoto-news"
+    mock_serper.search.side_effect = lambda q, search_type="search", limit=5: [
+        SearchResultItem(title="Kyoto Guide", url=genuine_url_1, snippet="Kyoto guide info"),
+        SearchResultItem(title="Kyoto News", url=genuine_url_2, snippet="Kyoto news info"),
+    ]
+
+    mock_weather = MagicMock(spec=WeatherClient)
+    mock_weather.geocode_destination.return_value = None
+
+    # Groq returns a mix: genuine URL, fabricated URL, missing URL
+    fabricated_url = "https://hallucinated-travel-blog.com/fake-shrine"
+    fabricated_news_url = "https://hallucinated-news.com/fake-news"
+
+    mock_llm_json = {
+        "destination": "Kyoto",
+        "attractions": [
+            {
+                "name": "Kinkaku-ji",
+                "description": "Golden Pavilion",
+                "visitor_tips": "Go early",
+                "source_url": genuine_url_1,  # Genuine retrieved URL
+            },
+            {
+                "name": "Fabricated Shrine",
+                "description": "Non-existent or ungrounded URL",
+                "visitor_tips": None,
+                "source_url": fabricated_url,  # Fabricated URL
+            },
+            {
+                "name": "Arashiyama Bamboo Grove",
+                "description": "Bamboo grove",
+                "visitor_tips": None,
+                "source_url": None,  # Missing source URL
+            },
+        ],
+        "local_tips": ["Use public transit"],
+        "safety_considerations": ["Stay hydrated"],
+        "seasonal_considerations": ["Autumn foliage"],
+        "recent_local_news": [
+            {
+                "title": "Kyoto Railway News",
+                "summary": "Service expansion",
+                "source_url": genuine_url_2,  # Genuine retrieved URL
+                "publication_date": "2026-10-01",
+                "event_date": None,
+                "category": "transport",
+                "potential_travel_impact": "low",
+                "is_verified": True,
+            }
+        ],
+        "historical_local_reports": [
+            {
+                "title": "Historical 2025 Report",
+                "summary": "Past festival notes",
+                "source_url": fabricated_news_url,  # Fabricated URL
+                "publication_date": "2025-10-01",
+                "event_date": None,
+                "category": "culture",
+                "potential_travel_impact": "low",
+                "is_verified": True,
+            }
+        ],
+        "upcoming_local_events": [
+            {
+                "title": "Local Market",
+                "summary": "Weekend market",
+                "source_url": None,  # Missing source URL
+                "publication_date": None,
+                "event_date": "2026-11-02",
+                "category": "shopping",
+                "potential_travel_impact": "low",
+                "is_verified": True,
+            }
+        ],
+        "source_urls": [genuine_url_1, fabricated_url],
+        "warnings_and_uncertainties": [],
+    }
+
+    mock_groq = MagicMock()
+    mock_choice = MagicMock()
+    mock_choice.message.content = json.dumps(mock_llm_json)
+    mock_groq.chat.completions.create.return_value.choices = [mock_choice]
+
+    result = run_researcher_agent(
+        request={"destination": "Kyoto", "start_date": "2026-11-01", "end_date": "2026-11-03"},
+        serper_client=mock_serper,
+        weather_client=mock_weather,
+        groq_client=mock_groq,
+    )
+
+    # 1. Genuine URL is preserved
+    assert result["attractions"][0]["source_url"] == genuine_url_1
+    assert result["recent_local_news"][0]["source_url"] == genuine_url_2
+
+    # 2. Fabricated URL is removed (set to None)
+    assert result["attractions"][1]["source_url"] is None
+    assert result["historical_local_reports"][0]["source_url"] is None
+
+    # 3. Missing URL remains None without crashing
+    assert result["attractions"][2]["source_url"] is None
+    assert result["upcoming_local_events"][0]["source_url"] is None
+
+    # 4. Fabricated URL is omitted from top-level source_urls; genuine URLs are retained
+    assert fabricated_url not in result["source_urls"]
+    assert genuine_url_1 in result["source_urls"]
+    assert genuine_url_2 in result["source_urls"]
+
+    # 5. Warnings are recorded for the removed unsupported URLs
+    warnings = " ".join(result["warnings_and_uncertainties"])
+    assert fabricated_url in warnings
+    assert fabricated_news_url in warnings
+
+
+# ---------------------------------------------------------------------------
+# 8. Web Search Failure Handling & Credential Masking Tests
+# ---------------------------------------------------------------------------
+
+
+def test_partial_search_failure_recorded_in_warnings():
+    """Test that a partial search failure (one category fails) is recorded in warnings without leaking secrets."""
+    import json
+    mock_serper = MagicMock(spec=SerperClient)
+
+    # Destination search succeeds, news search fails with sensitive token in error
+    def mock_search(query, search_type="search", limit=5):
+        if search_type == "news":
+            raise PermissionError("401 Unauthorized: Invalid X-API-KEY secret_key_12345abcde")
+        return [SearchResultItem(title="Kyoto Guide", url="https://example.com/kyoto", snippet="Guide")]
+
+    mock_serper.search.side_effect = mock_search
+
+    mock_weather = MagicMock(spec=WeatherClient)
+    mock_weather.geocode_destination.return_value = None
+
+    mock_llm_json = {
+        "destination": "Kyoto",
+        "attractions": [
+            {"name": "Kyoto Shrine", "description": "Shrine", "visitor_tips": None, "source_url": "https://example.com/kyoto"}
+        ],
+        "local_tips": [],
+        "safety_considerations": [],
+        "seasonal_considerations": [],
+        "recent_local_news": [],
+        "historical_local_reports": [],
+        "upcoming_local_events": [],
+        "source_urls": ["https://example.com/kyoto"],
+        "warnings_and_uncertainties": [],
+    }
+    mock_groq = MagicMock()
+    mock_choice = MagicMock()
+    mock_choice.message.content = json.dumps(mock_llm_json)
+    mock_groq.chat.completions.create.return_value.choices = [mock_choice]
+
+    result = run_researcher_agent(
+        request={"destination": "Kyoto", "start_date": "2026-11-01", "end_date": "2026-11-03"},
+        serper_client=mock_serper,
+        weather_client=mock_weather,
+        groq_client=mock_groq,
+    )
+
+    # Check that research succeeded with partial evidence
+    assert len(result["attractions"]) == 1
+    # Check that category failure is recorded in warnings
+    warnings_str = " ".join(result["warnings_and_uncertainties"])
+    assert "recent news" in warnings_str
+    # Verify no credentials leaked
+    assert "secret_key_12345abcde" not in warnings_str
+    assert "x-api-key" not in warnings_str.lower()
+
+
+def test_complete_search_failure_raises_error():
+    """Test that a complete search failure raises a clear error and does not fabricate destination results."""
+    mock_serper = MagicMock(spec=SerperClient)
+    mock_serper.search.side_effect = httpx.ConnectError("Network connection unreachable with token=secret_token_abc")
+
+    mock_weather = MagicMock(spec=WeatherClient)
+    mock_weather.geocode_destination.return_value = None
+    mock_groq = MagicMock()
+
+    with pytest.raises(RuntimeError) as excinfo:
+        run_researcher_agent(
+            request={"destination": "Kyoto", "start_date": "2026-11-01", "end_date": "2026-11-03"},
+            serper_client=mock_serper,
+            weather_client=mock_weather,
+            groq_client=mock_groq,
+        )
+
+    err_msg = str(excinfo.value)
+    assert "Destination research failed" in err_msg
+    # Verify credentials/tokens are never leaked
+    assert "secret_token_abc" not in err_msg
+    # Verify Groq was never called to fabricate results
+    mock_groq.chat.completions.create.assert_not_called()
+

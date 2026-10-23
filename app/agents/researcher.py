@@ -5,9 +5,9 @@ from typing import Any, Optional
 from groq import Groq
 
 from app.config import get_groq_api_key, get_groq_model, get_serper_api_key
-from app.schemas.research import ResearchResult
+from app.schemas.research import ResearchResult, WeatherContext
 from app.tools.weather import WeatherClient, gather_weather_intelligence
-from app.tools.web_search import SerperClient, gather_destination_research
+from app.tools.web_search import SearchEvidence, SerperClient, gather_destination_research
 
 SYSTEM_PROMPT = """You are an expert, meticulous travel intelligence researcher.
 Your task is to synthesize the provided destination search results and weather data into a strict JSON object.
@@ -72,20 +72,72 @@ SCHEMA SPECIFICATION:
 """
 
 
+def _format_weather_evidence(
+    weather: Optional[WeatherContext],
+    weather_summary: Optional[str] = None,
+) -> str:
+    """Format full structured WeatherContext into detailed evidence text for the LLM."""
+    if weather is None:
+        return f"WEATHER STATUS / SUMMARY: {weather_summary or 'Weather information unavailable.'}"
+
+    lines: list[str] = [
+        f"WEATHER TYPE / STATUS: {weather.weather_type}",
+    ]
+    if weather.notes:
+        lines.append(f"NOTES: {weather.notes}")
+
+    if weather.forecast_days:
+        lines.append("DAILY FORECAST OBSERVATIONS:")
+        for day in weather.forecast_days:
+            prob_str = (
+                f", Precip Probability: {day.precipitation_probability_pct}%"
+                if day.precipitation_probability_pct is not None
+                else ""
+            )
+            lines.append(
+                f"- Date: {day.date} | High: {day.temp_max_c}°C | Low: {day.temp_min_c}°C | "
+                f"Rain Sum: {day.precipitation_sum_mm}mm{prob_str} | Condition: {day.weather_condition}"
+            )
+
+    if weather.historical_comparison:
+        hc = weather.historical_comparison
+        lines.append("HISTORICAL CLIMATE COMPARISON FIGURES:")
+        if hc.comparison_years:
+            lines.append(f"- Comparison Years: {hc.comparison_years}")
+        if hc.equivalent_dates_last_year:
+            lines.append(f"- Equivalent Dates Last Year: {hc.equivalent_dates_last_year}")
+        if hc.typical_temp_max_c is not None:
+            lines.append(f"- Typical High: {hc.typical_temp_max_c}°C")
+        if hc.typical_temp_min_c is not None:
+            lines.append(f"- Typical Low: {hc.typical_temp_min_c}°C")
+        if hc.typical_precipitation_mm is not None:
+            lines.append(f"- Typical Total Precipitation: {hc.typical_precipitation_mm}mm")
+        if hc.rainy_days_count is not None:
+            lines.append(f"- Typical Rainy Days Count: {hc.rainy_days_count}")
+        if hc.summary:
+            lines.append(f"- Summary: {hc.summary}")
+
+    return "\n".join(lines)
+
+
 def _format_evidence_package(
     destination: str,
     start_date: str,
     end_date: str,
     interests: list[str],
-    search_data: dict[str, list[Any]],
-    weather_summary: str,
+    search_data: Any,
+    weather_context: Optional[WeatherContext] = None,
+    weather_summary: Optional[str] = None,
 ) -> str:
-    """Format collected search items into a token-efficient text prompt for the LLM."""
+    """Format collected search items and structured weather into a prompt for the LLM."""
+    weather_text = _format_weather_evidence(weather_context, weather_summary)
     lines: list[str] = [
         f"DESTINATION: {destination}",
         f"TRAVEL DATES: {start_date} to {end_date}",
         f"INTERESTS: {', '.join(interests) if interests else 'General sightseeing'}",
-        f"WEATHER SUMMARY: {weather_summary}",
+        "",
+        "--- EVIDENCE SECTION: WEATHER INTELLIGENCE & OBSERVATIONS ---",
+        weather_text,
         "",
         "--- EVIDENCE SECTION 1: DESTINATION & ATTRACTIONS ---",
     ]
@@ -111,6 +163,64 @@ def _format_evidence_package(
         )
 
     return "\n".join(lines)
+
+
+def _verify_source_provenance(
+    parsed_json: dict[str, Any],
+    valid_source_urls: set[str],
+) -> None:
+    """Validate source URLs attached to attractions and reports against genuine search results.
+
+    A URL supplied by the LLM must match a URL actually returned by the search tool
+    before it is retained as a source URL. If it does not match, remove the unsupported
+    URL (set to None) and add a warning.
+
+    Genuine discovered URLs are retained. Items without source URLs remain None without warning.
+    """
+    warnings = parsed_json.setdefault("warnings_and_uncertainties", [])
+
+    # 1. Attractions
+    for item in parsed_json.get("attractions", []):
+        url = item.get("source_url")
+        if url:
+            if url not in valid_source_urls:
+                name = item.get("name", "Attraction")
+                item["source_url"] = None
+                warnings.append(
+                    f"Removed unsupported source URL '{url}' from attraction '{name}'."
+                )
+        else:
+            item["source_url"] = None
+
+    # 2. Local report categories
+    sections = [
+        ("recent_local_news", "recent local news"),
+        ("historical_local_reports", "historical local report"),
+        ("upcoming_local_events", "upcoming local event"),
+    ]
+    for section_key, label in sections:
+        for item in parsed_json.get(section_key, []):
+            url = item.get("source_url")
+            if url:
+                if url not in valid_source_urls:
+                    title = item.get("title", "Item")
+                    item["source_url"] = None
+                    warnings.append(
+                        f"Removed unsupported source URL '{url}' from {label} '{title}'."
+                    )
+            else:
+                item["source_url"] = None
+
+    # 3. Top-level source_urls
+    llm_source_urls = parsed_json.get("source_urls", [])
+    for top_url in llm_source_urls:
+        if top_url and top_url not in valid_source_urls:
+            warnings.append(
+                f"Removed unsupported top-level source URL '{top_url}' not found in search results."
+            )
+
+    # Retain all genuine discovered source URLs
+    parsed_json["source_urls"] = sorted(list(valid_source_urls))
 
 
 def run_researcher_agent(
@@ -155,6 +265,32 @@ def run_researcher_agent(
         client=serper_client,
     )
 
+    search_failures: dict[str, str] = getattr(search_data, "failures", {})
+    if isinstance(search_data, SearchEvidence):
+        has_results = search_data.has_any_results
+        discovered_urls = {item.url for item in search_data.all_items() if item.url}
+    else:
+        has_results = any(bool(v) for v in search_data.values() if isinstance(v, list))
+        discovered_urls = {
+            item.url
+            for group in search_data.values()
+            if isinstance(group, list)
+            for item in group
+            if getattr(item, "url", None)
+        }
+
+    # Complete search failure: return clear research failure rather than fabricating
+    if not has_results:
+        failure_summary = (
+            "; ".join(f"{cat}: {err}" for cat, err in search_failures.items())
+            if search_failures
+            else "No search results returned for any category."
+        )
+        raise RuntimeError(
+            f"Destination research failed: Unable to gather search evidence for '{destination}'. "
+            f"Search failures: {failure_summary}"
+        )
+
     # 3. Gather Weather Intelligence via Open-Meteo
     coords, weather_context = gather_weather_intelligence(
         destination=destination,
@@ -171,6 +307,7 @@ def run_researcher_agent(
         end_date=end_date,
         interests=interests,
         search_data=search_data,
+        weather_context=weather_context,
         weather_summary=weather_note,
     )
 
@@ -198,19 +335,22 @@ def run_researcher_agent(
     except Exception as exc:
         raise RuntimeError(f"Groq research synthesis failed: {exc}") from None
 
-    # 5. Inject deterministic Weather Context and Coordinates
+    # 5. Inject deterministic Weather Context and Coordinates directly from Open-Meteo
     parsed_json["destination"] = destination
     parsed_json["coordinates"] = coords.model_dump() if coords else None
     parsed_json["weather"] = weather_context.model_dump()
 
-    # Consolidate all genuine URLs discovered from Serper into source_urls
-    discovered_urls = {
-        item.url for group in search_data.values() for item in group if item.url
-    }
-    existing_urls = set(parsed_json.get("source_urls", []))
-    parsed_json["source_urls"] = sorted(list(existing_urls.union(discovered_urls)))
+    # 6. Record category search failures in warnings if partial failure occurred
+    for cat, err in search_failures.items():
+        cat_name = cat.replace("_", " ")
+        warning_msg = f"Search evidence was unavailable for {cat_name}: {err}"
+        if warning_msg not in parsed_json.setdefault("warnings_and_uncertainties", []):
+            parsed_json["warnings_and_uncertainties"].append(warning_msg)
 
-    # 6. Validate with Pydantic
+    # 7. Validate source provenance (verify URLs against discovered results, remove fabricated, preserve genuine)
+    _verify_source_provenance(parsed_json, discovered_urls)
+
+    # 8. Validate with Pydantic
     try:
         validated_result = ResearchResult.model_validate(parsed_json)
     except Exception as exc:

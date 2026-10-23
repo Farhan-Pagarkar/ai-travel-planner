@@ -1,6 +1,6 @@
 """Web search tool using Serper API for Google search and news retrieval."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Optional
 import httpx
@@ -9,6 +9,18 @@ from app.config import get_serper_api_key
 
 SERPER_SEARCH_URL = "https://google.serper.dev/search"
 SERPER_NEWS_URL = "https://google.serper.dev/news"
+
+
+def _sanitize_search_error(exc: Exception) -> str:
+    """Sanitize error messages to avoid leaking credentials or sensitive tokens."""
+    msg = str(exc).lower()
+    if any(token in msg for token in ("api-key", "x-api-key", "unauthorized", "401", "403")):
+        return "Authentication or authorization failure when querying search provider."
+    if "timeout" in msg:
+        return "Search request timed out."
+    if "rate limit" in msg or "429" in msg:
+        return "Search provider rate limit reached."
+    return f"Search request failed: {type(exc).__name__}"
 
 
 @dataclass
@@ -20,6 +32,67 @@ class SearchResultItem:
     snippet: str
     source: Optional[str] = None
     publication_date: Optional[str] = None
+
+
+@dataclass
+class SearchEvidence:
+    """Container holding categorized search results and category failure notes."""
+
+    destination_info: list[SearchResultItem] = field(default_factory=list)
+    recent_news: list[SearchResultItem] = field(default_factory=list)
+    upcoming_events: list[SearchResultItem] = field(default_factory=list)
+    historical_reports: list[SearchResultItem] = field(default_factory=list)
+    failures: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def has_any_results(self) -> bool:
+        return bool(
+            self.destination_info
+            or self.recent_news
+            or self.upcoming_events
+            or self.historical_reports
+        )
+
+    def all_items(self) -> list[SearchResultItem]:
+        return (
+            self.destination_info
+            + self.recent_news
+            + self.upcoming_events
+            + self.historical_reports
+        )
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return getattr(self, key, default)
+
+    def __getitem__(self, key: str) -> Any:
+        return getattr(self, key)
+
+    def __contains__(self, key: str) -> bool:
+        return hasattr(self, key)
+
+    def values(self):
+        return [
+            self.destination_info,
+            self.recent_news,
+            self.upcoming_events,
+            self.historical_reports,
+        ]
+
+    def items(self):
+        return [
+            ("destination_info", self.destination_info),
+            ("recent_news", self.recent_news),
+            ("upcoming_events", self.upcoming_events),
+            ("historical_reports", self.historical_reports),
+        ]
+
+    def keys(self):
+        return [
+            "destination_info",
+            "recent_news",
+            "upcoming_events",
+            "historical_reports",
+        ]
 
 
 class SerperClient:
@@ -116,11 +189,11 @@ def gather_destination_research(
     end_date: str,
     interests: list[str],
     client: Optional[SerperClient] = None,
-) -> dict[str, list[SearchResultItem]]:
+) -> SearchEvidence:
     """Gather targeted destination, news, events, and historical evidence.
 
     Uses 4 targeted queries to avoid excessive search credit usage while
-    covering all required research aspects.
+    covering all required research aspects. Tracks and sanitizes category failures.
     """
     if client is None:
         client = SerperClient()
@@ -147,38 +220,40 @@ def gather_destination_research(
 
     historical_query = f"{destination} weather disruptions events {month_name} {prev_year}"
 
-    results: dict[str, list[SearchResultItem]] = {
-        "destination_info": [],
-        "recent_news": [],
-        "upcoming_events": [],
-        "historical_reports": [],
-    }
+    failures: dict[str, str] = {}
+    dest_info: list[SearchResultItem] = []
+    recent_news: list[SearchResultItem] = []
+    upcoming_events: list[SearchResultItem] = []
+    historical_reports: list[SearchResultItem] = []
 
-    # Execute searches safely
+    # 1. General search
     try:
-        results["destination_info"] = client.search(general_query, search_type="search", limit=4)
+        dest_info = client.search(general_query, search_type="search", limit=4)
     except Exception as exc:
-        results["destination_info"] = [
-            SearchResultItem(
-                title="Search Error",
-                url="",
-                snippet=f"Destination search unavailable: {exc}",
-            )
-        ]
+        failures["destination_info"] = _sanitize_search_error(exc)
 
+    # 2. News search
     try:
-        results["recent_news"] = client.search(news_query, search_type="news", limit=4)
+        recent_news = client.search(news_query, search_type="news", limit=4)
     except Exception as exc:
-        results["recent_news"] = []
+        failures["recent_news"] = _sanitize_search_error(exc)
 
+    # 3. Upcoming events search
     try:
-        results["upcoming_events"] = client.search(events_query, search_type="search", limit=4)
+        upcoming_events = client.search(events_query, search_type="search", limit=4)
     except Exception as exc:
-        results["upcoming_events"] = []
+        failures["upcoming_events"] = _sanitize_search_error(exc)
 
+    # 4. Historical reports search
     try:
-        results["historical_reports"] = client.search(historical_query, search_type="search", limit=4)
+        historical_reports = client.search(historical_query, search_type="search", limit=4)
     except Exception as exc:
-        results["historical_reports"] = []
+        failures["historical_reports"] = _sanitize_search_error(exc)
 
-    return results
+    return SearchEvidence(
+        destination_info=dest_info,
+        recent_news=recent_news,
+        upcoming_events=upcoming_events,
+        historical_reports=historical_reports,
+        failures=failures,
+    )
