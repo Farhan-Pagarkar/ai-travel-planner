@@ -248,3 +248,67 @@ def test_api_enforces_revision_limit(client: TestClient, sample_payload: dict[st
     res_after = client.post(f"/plan/{plan_id}/review", json={"action": "approve"})
     assert res_after.status_code == 409
     assert "not awaiting review" in res_after.json()["detail"].lower()
+
+
+def test_frontend_routes_served(client: TestClient):
+    """Verify that the frontend HTML, CSS, and JS are properly served by FastAPI."""
+    res_index = client.get("/")
+    assert res_index.status_code == 200
+    assert "text/html" in res_index.headers["content-type"]
+    assert "AI Travel Planner" in res_index.text
+    assert "plan-form" in res_index.text
+
+    res_html = client.get("/index.html")
+    assert res_html.status_code == 200
+    assert "text/html" in res_html.headers["content-type"]
+
+    res_css = client.get("/static/styles.css")
+    assert res_css.status_code == 200
+    assert "app-header" in res_css.text
+
+    res_js = client.get("/static/app.js")
+    assert res_js.status_code == 200
+    assert "currentPlanId" in res_js.text
+
+
+def test_create_plan_returns_controlled_502_on_llm_failure(
+    client: TestClient, sample_payload: dict[str, Any], monkeypatch
+):
+    """When itinerary generation fails permanently, the API returns HTTP 502 with sanitized detail instead of HTTP 500."""
+    from app.agents.planner import PlannerError
+
+    def failing_planner(*args, **kwargs):
+        raise PlannerError("Groq itinerary generation failed after retry: Error code: 400 - Failed to validate JSON. Please adjust your prompt. code: json_validate_failed")
+
+    monkeypatch.setattr("app.graph.nodes.run_planner_agent", failing_planner)
+    monkeypatch.setattr("app.agents.planner.run_planner_agent", failing_planner)
+
+    res = client.post("/plan", json=sample_payload)
+    assert res.status_code == 502
+    assert "Unable to generate travel plan" in res.json()["detail"]
+    assert "json_validate_failed" in res.json()["detail"]
+
+
+def test_create_plan_sanitizes_secrets_in_error_response(
+    client: TestClient, sample_payload: dict[str, Any], monkeypatch
+):
+    """When an error contains secret API keys or headers, they are scrubbed from the response."""
+    from app.agents.planner import PlannerError
+
+    secret_key = "gsk_live_api_secret_key_123456789"
+    def failing_planner(*args, **kwargs):
+        raise PlannerError(f"Groq API call failed with key {secret_key}")
+
+    monkeypatch.setattr("app.graph.nodes.run_planner_agent", failing_planner)
+    monkeypatch.setattr("app.agents.planner.run_planner_agent", failing_planner)
+
+    res = client.post("/plan", json=sample_payload)
+    assert res.status_code == 502
+    assert secret_key not in res.json()["detail"]
+    assert "[REDACTED_API_KEY]" in res.json()["detail"]
+
+
+def test_favicon_route(client: TestClient):
+    """Verify favicon endpoint returns 204."""
+    res = client.get("/favicon.ico")
+    assert res.status_code == 204

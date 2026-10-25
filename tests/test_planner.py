@@ -1,10 +1,13 @@
+import os
+import httpx
+import groq
 """Unit and integration tests for Activity Lookup, Budget Calculator, and Planner Agent."""
 
 import json
 from unittest.mock import MagicMock
 import pytest
 
-from app.agents.planner import _validate_itinerary_grounding, run_planner_agent
+from app.agents.planner import PlannerError, _validate_itinerary_grounding, run_planner_agent
 from app.schemas.itinerary import Itinerary
 from app.tools.activities import ActivityCandidate, lookup_activity_candidates
 from app.tools.budget import DEFAULT_BUDGET_POLICY, calculate_budget_allocation
@@ -313,6 +316,8 @@ def test_planner_agent_evidence_passed_to_groq(sample_research_data):
 
     # Verify prompt contents passed to Groq
     call_args = mock_groq.chat.completions.create.call_args[1]
+    assert call_args["reasoning_effort"] == "low"
+    assert call_args["include_reasoning"] is False
     prompt_text = call_args["messages"][1]["content"]
 
     assert "Kyoto, Japan" in prompt_text
@@ -919,3 +924,166 @@ def test_planner_agent_fails_when_name_mismatch_persists_after_correction(sample
             research=sample_research_data,
             groq_client=mock_groq,
         )
+
+
+def test_planner_agent_retries_on_groq_json_validate_failed_and_succeeds(sample_research_data):
+    """Planner Agent triggers bounded correction retry when Groq returns 400 json_validate_failed."""
+    mock_groq = MagicMock()
+
+    req = httpx.Request("POST", "https://api.groq.com/openai/v1/chat/completions")
+    resp = httpx.Response(
+        400,
+        request=req,
+        json={
+            "error": {
+                "message": "Failed to validate JSON. Please adjust your prompt.",
+                "type": "invalid_request_error",
+                "code": "json_validate_failed",
+            }
+        },
+    )
+    groq_400 = groq.BadRequestError(
+        message="Error code: 400 - Failed to validate JSON. Please adjust your prompt. code: json_validate_failed",
+        response=resp,
+        body={
+            "error": {
+                "message": "Failed to validate JSON. Please adjust your prompt.",
+                "type": "invalid_request_error",
+                "code": "json_validate_failed",
+            }
+        },
+    )
+
+    valid_itinerary = {
+        "destination": "Kyoto, Japan",
+        "total_days": 1,
+        "currency": "USD",
+        "total_estimated_cost": 100.0,
+        "days": [
+            {
+                "day": 1,
+                "date": "2026-11-01",
+                "focus": "sightseeing",
+                "theme": "sightseeing",
+                "activities": [
+                    {
+                        "name": "Fushimi Inari Shrine",
+                        "description": "Historic shrine.",
+                        "category": "attraction",
+                        "start_time": "09:00 AM",
+                        "estimated_duration": "3 hours",
+                        "estimated_cost": 100.0,
+                        "candidate_id": "attr-1",
+                        "source_url": "https://example.com/fushimi",
+                    }
+                ],
+                "estimated_cost": 100.0,
+            }
+        ],
+        "summary": "1-day trip in Kyoto.",
+        "assumptions": [],
+        "warnings": [],
+    }
+
+    choice = MagicMock()
+    choice.message.content = json.dumps(valid_itinerary)
+
+    # Attempt 1 raises 400 json_validate_failed, Attempt 2 returns valid JSON
+    mock_groq.chat.completions.create.side_effect = [
+        groq_400,
+        MagicMock(choices=[choice]),
+    ]
+
+    request = {
+        "destination": "Kyoto, Japan",
+        "start_date": "2026-11-01",
+        "end_date": "2026-11-01",
+        "total_trip_budget": 500.0,
+    }
+
+    result = run_planner_agent(
+        request=request,
+        research=sample_research_data,
+        groq_client=mock_groq,
+    )
+
+    assert mock_groq.chat.completions.create.call_count == 2
+    for call in mock_groq.chat.completions.create.call_args_list:
+        assert call[1]["reasoning_effort"] == "low"
+        assert call[1]["include_reasoning"] is False
+    assert result["destination"] == "Kyoto, Japan"
+    assert result["days"][0]["activities"][0]["name"] == "Fushimi Inari Shrine"
+
+
+def test_planner_agent_fails_cleanly_on_persistent_groq_json_validate_failed(sample_research_data):
+    """Planner Agent raises PlannerError without exposing secrets when Groq json_validate_failed persists."""
+    mock_groq = MagicMock()
+
+    secret_key = "gsk_testsecretkey12345"
+    req = httpx.Request("POST", "https://api.groq.com/openai/v1/chat/completions")
+    resp = httpx.Response(
+        400,
+        request=req,
+        json={"error": {"message": f"Failed with {secret_key}", "code": "json_validate_failed"}},
+    )
+    groq_400 = groq.BadRequestError(
+        message=f"Error code: 400 - Failed with {secret_key} code: json_validate_failed",
+        response=resp,
+        body={"error": {"message": f"Failed with {secret_key}", "code": "json_validate_failed"}},
+    )
+
+    # Both attempts fail
+    mock_groq.chat.completions.create.side_effect = [groq_400, groq_400]
+
+    request = {
+        "destination": "Kyoto, Japan",
+        "start_date": "2026-11-01",
+        "end_date": "2026-11-01",
+        "total_trip_budget": 500.0,
+    }
+
+    with pytest.raises(PlannerError) as exc_info:
+        run_planner_agent(
+            request=request,
+            research=sample_research_data,
+            groq_client=mock_groq,
+        )
+
+    assert mock_groq.chat.completions.create.call_count == 2
+    err_str = str(exc_info.value)
+    assert "Groq itinerary generation failed after retry" in err_str
+    assert secret_key not in err_str
+    assert "[REDACTED_API_KEY]" in err_str
+
+
+@pytest.mark.skipif(
+    not os.getenv("RUN_LIVE_TESTS"),
+    reason="Opt-in live API test requiring external Groq API key",
+)
+def test_live_planner_smoke_test(sample_research_data):
+    """Opt-in live smoke test verifying real Groq API produces a valid grounded itinerary."""
+    groq_api_key = os.getenv("GROQ_API_KEY")
+    if not groq_api_key:
+        pytest.skip("GROQ_API_KEY not configured")
+
+    request = {
+        "destination": "Kyoto, Japan",
+        "start_date": "2026-11-01",
+        "end_date": "2026-11-02",
+        "total_trip_budget": 500.0,
+        "currency": "USD",
+        "interests": ["temples", "culture"],
+        "traveler_count": 1,
+    }
+
+    result = run_planner_agent(
+        request=request,
+        research=sample_research_data,
+    )
+
+    assert result["destination"] == "Kyoto, Japan"
+    assert result["total_days"] == 2
+    assert len(result["days"]) == 2
+    assert result["total_estimated_cost"] <= 500.0
+    for day in result["days"]:
+        assert len(day["activities"]) > 0

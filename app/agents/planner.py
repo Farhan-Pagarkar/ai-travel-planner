@@ -3,14 +3,55 @@
 from datetime import date, datetime, timedelta
 import json
 import math
+import re
 from typing import Any, Optional
 from groq import Groq
 
 from app.config import get_groq_api_key, get_groq_model
 from app.schemas.itinerary import Itinerary
 from app.schemas.research import ResearchResult
-from app.tools.activities import ActivityCandidate, is_matching_activity_name, lookup_activity_candidates, normalize_activity_name
+from app.tools.activities import (
+    ActivityCandidate,
+    is_matching_activity_name,
+    lookup_activity_candidates,
+    normalize_activity_name,
+)
 from app.tools.budget import calculate_budget_allocation
+
+
+class PlannerError(RuntimeError):
+    """Raised when itinerary planning fails due to generation, provider, or validation errors."""
+    pass
+
+
+def _sanitize_error_message(msg: str) -> str:
+    """Scrub sensitive credentials, API keys, or authorization headers from error messages."""
+    if not msg:
+        return ""
+    scrubbed = re.sub(r"gsk_[A-Za-z0-9_-]+", "[REDACTED_API_KEY]", str(msg))
+    scrubbed = re.sub(r"Bearer\s+[A-Za-z0-9._-]+", "Bearer [REDACTED]", scrubbed, flags=re.IGNORECASE)
+    scrubbed = re.sub(
+        r"['\"]?Authorization['\"]?\s*:\s*['\"][^'\"]+['\"]",
+        "'Authorization': '[REDACTED]'",
+        scrubbed,
+        flags=re.IGNORECASE,
+    )
+    return scrubbed
+
+
+def _extract_and_parse_json(content: str) -> dict[str, Any]:
+    """Parse JSON content safely, stripping markdown fences or wrapping whitespace if present."""
+    if not content or not content.strip():
+        raise ValueError("Empty response received from itinerary generator.")
+    text = content.strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+    return json.loads(text)
 
 
 def _parse_safe_float(val: Any) -> Optional[float]:
@@ -24,6 +65,7 @@ def _parse_safe_float(val: Any) -> Optional[float]:
         return f
     except (ValueError, TypeError):
         return None
+
 
 PLANNER_SYSTEM_PROMPT = """You are an expert, meticulous travel itinerary planner.
 Your task is to construct a structured, day-by-day travel itinerary grounded strictly in the provided research, activity candidates, and budget constraints.
@@ -40,18 +82,18 @@ CRITICAL GROUNDING AND VALIDATION RULES:
 9. All costs must be non-negative numbers.
 10. If candidate activities are limited, schedule leisure, free-time, or scenic walking blocks rather than inventing attractions. Note any limitations in warnings.
 11. If user feedback or requested modifications are provided, incorporate them into the plan while keeping unaffected days consistent.
-12. Return ONLY a single valid JSON object strictly matching the schema.
+12. Return ONLY a single valid JSON object strictly matching the schema. Do not output markdown code fences, think tags, or extra commentary.
 
 SCHEMA SPECIFICATION:
 {
   "destination": "string",
-  "total_days": 3,
+  "total_days": 1,
   "currency": "USD",
-  "total_estimated_cost": 750.0,
+  "total_estimated_cost": 250.0,
   "days": [
     {
       "day": 1,
-      "date": "2026-11-01",
+      "date": "YYYY-MM-DD",
       "focus": "string",
       "theme": "string or null",
       "activities": [
@@ -62,7 +104,7 @@ SCHEMA SPECIFICATION:
           "start_time": "string or null",
           "estimated_duration": "string or null",
           "estimated_cost": 25.0,
-          "candidate_id": "attr-1 or null",
+          "candidate_id": "candidate_id or null",
           "source_url": "https://... or null"
         }
       ],
@@ -151,7 +193,9 @@ def _validate_itinerary_grounding(
     # 1. Date coverage and order checks
     days = itinerary_data.get("days", [])
     if not isinstance(days, list) or len(days) != len(expected_dates):
-        errors.append(f"Itinerary day count mismatch: expected {len(expected_dates)} day(s), got {len(days) if isinstance(days, list) else 0}.")
+        errors.append(
+            f"Itinerary day count mismatch: expected {len(expected_dates)} day(s), got {len(days) if isinstance(days, list) else 0}."
+        )
         return errors
 
     actual_dates = [d.get("date") for d in days if isinstance(d, dict)]
@@ -212,7 +256,9 @@ def _validate_itinerary_grounding(
             raw_cost = act.get("estimated_cost", 0.0)
             parsed_cost = _parse_safe_float(raw_cost)
             if parsed_cost is None or parsed_cost < 0:
-                errors.append(f"Activity '{act_name}' on Day {day_num} has invalid cost ({raw_cost}). Must be a finite, non-negative number.")
+                errors.append(
+                    f"Activity '{act_name}' on Day {day_num} has invalid cost ({raw_cost}). Must be a finite, non-negative number."
+                )
 
             category = str(act.get("category", "")).lower().strip()
 
@@ -401,19 +447,49 @@ def run_planner_agent(
         {"role": "user", "content": user_prompt},
     ]
 
+    groq_call_kwargs: dict[str, Any] = {
+        "model": groq_model,
+        "response_format": {"type": "json_object"},
+        "reasoning_effort": "low",
+        "include_reasoning": False,
+        "max_tokens": 4096,
+        "temperature": 0.1,
+    }
+
     # Attempt 1: Generation
+    content = ""
+    parsed_itinerary: Optional[dict[str, Any]] = None
+    initial_error: Optional[Exception] = None
+
     try:
         completion = groq_client.chat.completions.create(
-            model=groq_model,
             messages=messages,
-            response_format={"type": "json_object"},
-            max_tokens=4096,
-            temperature=0.2,
+            **groq_call_kwargs,
         )
-        content = completion.choices[0].message.content or "{}"
-        parsed_itinerary = json.loads(content)
+        content = completion.choices[0].message.content or ""
+        parsed_itinerary = _extract_and_parse_json(content)
     except Exception as exc:
-        raise RuntimeError(f"Groq itinerary generation failed: {exc}") from None
+        initial_error = exc
+
+    # Bounded single correction attempt if initial generation call failed (e.g., json_validate_failed)
+    if initial_error is not None:
+        sanitized_init_err = _sanitize_error_message(str(initial_error))
+        correction_prompt = (
+            f"Your previous attempt to generate the itinerary failed: {sanitized_init_err}.\n"
+            "Please generate strictly valid JSON conforming exactly to the schema specification. "
+            "Return ONLY the single JSON object without markdown fences, think blocks, or extra commentary."
+        )
+        messages.append({"role": "user", "content": correction_prompt})
+        try:
+            correction_completion = groq_client.chat.completions.create(
+                messages=messages,
+                **groq_call_kwargs,
+            )
+            content = correction_completion.choices[0].message.content or ""
+            parsed_itinerary = _extract_and_parse_json(content)
+        except Exception as exc:
+            sanitized_exc = _sanitize_error_message(str(exc))
+            raise PlannerError(f"Groq itinerary generation failed after retry: {sanitized_exc}") from None
 
     # Deterministic grounding verification
     errors = _validate_itinerary_grounding(
@@ -425,8 +501,8 @@ def run_planner_agent(
         currency=currency,
     )
 
-    # Attempt 2: Bounded single correction attempt if validation failed
-    if errors:
+    # Bounded single correction attempt if validation failed AND we haven't already used our single retry
+    if errors and initial_error is None:
         correction_prompt = (
             f"Your previous itinerary output had the following validation errors:\n"
             + "\n".join(f"- {e}" for e in errors)
@@ -438,16 +514,14 @@ def run_planner_agent(
 
         try:
             correction_completion = groq_client.chat.completions.create(
-                model=groq_model,
                 messages=messages,
-                response_format={"type": "json_object"},
-                max_tokens=4096,
-                temperature=0.1,
+                **groq_call_kwargs,
             )
-            content = correction_completion.choices[0].message.content or "{}"
-            parsed_itinerary = json.loads(content)
+            content = correction_completion.choices[0].message.content or ""
+            parsed_itinerary = _extract_and_parse_json(content)
         except Exception as exc:
-            raise RuntimeError(f"Groq itinerary correction attempt failed: {exc}") from None
+            sanitized_exc = _sanitize_error_message(str(exc))
+            raise PlannerError(f"Groq itinerary correction attempt failed: {sanitized_exc}") from None
 
         # Re-validate after correction attempt
         errors = _validate_itinerary_grounding(
@@ -458,10 +532,11 @@ def run_planner_agent(
             destination=destination,
             currency=currency,
         )
-        if errors:
-            raise RuntimeError(
-                f"Itinerary planning failed validation after correction attempt: {'; '.join(errors)}"
-            )
+
+    if errors:
+        raise PlannerError(
+            f"Itinerary planning failed validation after correction attempt: {'; '.join(errors)}"
+        )
 
     # 7. Post-process itinerary metadata
     parsed_itinerary["destination"] = destination
@@ -481,7 +556,7 @@ def run_planner_agent(
     try:
         validated = Itinerary.model_validate(parsed_itinerary)
     except Exception as exc:
-        raise RuntimeError(f"Itinerary schema validation failed: {exc}") from None
+        raise PlannerError(f"Itinerary schema validation failed: {exc}") from None
 
     return validated.model_dump(mode="json")
 

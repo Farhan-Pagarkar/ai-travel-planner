@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AI Travel Planner</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <div class="container">
+    <header class="app-header">
+      <h1>AI Travel Planner</h1>
+      <p class="subtitle">Research-grounded itinerary planning with human-in-the-loop review.</p>
+    </header>
+
+    <!-- Travel Request Form -->
+    <section class="card form-section">
+      <h2>Plan a New Trip</h2>
+      <form id="plan-form" novalidate>
+        <div class="form-grid">
+          <div class="form-group full-width">
+            <label for="destination">Destination <span class="required">*</span></label>
+            <input type="text" id="destination" name="destination" placeholder="e.g. Kyoto, Japan" required>
+            <span class="field-hint">City, region, or country.</span>
+          </div>
+
+          <div class="form-group">
+            <label for="start_date">Start Date <span class="required">*</span></label>
+            <input type="date" id="start_date" name="start_date" required>
+          </div>
+
+          <div class="form-group">
+            <label for="end_date">End Date <span class="required">*</span></label>
+            <input type="date" id="end_date" name="end_date" required>
+          </div>
+
+          <div class="form-group">
+            <label for="total_trip_budget">Total Budget <span class="required">*</span></label>
+            <input type="number" id="total_trip_budget" name="total_trip_budget" min="1" step="any" placeholder="e.g. 2500" required>
+          </div>
+
+          <div class="form-group">
+            <label for="currency">Currency <span class="required">*</span></label>
+            <select id="currency" name="currency" required>
+              <option value="USD" selected>USD ($)</option>
+              <option value="EUR">EUR (€)</option>
+              <option value="GBP">GBP (£)</option>
+              <option value="JPY">JPY (¥)</option>
+              <option value="CAD">CAD ($)</option>
+              <option value="AUD">AUD ($)</option>
+            </select>
+          </div>
+
+          <div class="form-group">
+            <label for="traveler_count">Travelers <span class="required">*</span></label>
+            <input type="number" id="traveler_count" name="traveler_count" min="1" value="2" required>
+          </div>
+
+          <div class="form-group">
+            <label for="pace">Travel Pace</label>
+            <select id="pace" name="pace">
+              <option value="relaxed">Relaxed</option>
+              <option value="moderate" selected>Moderate</option>
+              <option value="fast">Fast</option>
+            </select>
+          </div>
+
+          <div class="form-group full-width">
+            <label for="interests">Interests (comma-separated) <span class="required">*</span></label>
+            <input type="text" id="interests" name="interests" placeholder="e.g. temples, culinary, gardens, history" required>
+            <span class="field-hint">Enter one or more traveler interests separated by commas.</span>
+          </div>
+
+          <div class="form-group full-width">
+            <label for="preference_notes">Optional Preferences or Notes</label>
+            <input type="text" id="preference_notes" name="preference_notes" placeholder="e.g. Prefer morning activities, avoid crowded areas">
+          </div>
+        </div>
+
+        <div id="form-error" class="alert alert-error hidden" role="alert"></div>
+
+        <div class="form-actions">
+          <button type="submit" id="submit-btn" class="btn btn-primary">Create Travel Plan</button>
+        </div>
+      </form>
+    </section>
+
+    <!-- Global Loading Indicator -->
+    <div id="loading-indicator" class="loading-box hidden" aria-live="polite">
+      <div class="spinner"></div>
+      <p id="loading-text">Researching destination, synthesizing itinerary, and validating constraints...</p>
+    </div>
+
+    <!-- Global Error Message Box -->
+    <div id="global-error" class="alert alert-error hidden" role="alert"></div>
+
+    <!-- Plan Display Section -->
+    <section id="plan-section" class="plan-section hidden">
+      <!-- Status & Metadata Bar -->
+      <div class="status-bar">
+        <div class="status-item">
+          <span class="status-label">Plan ID:</span>
+          <code id="display-plan-id" class="code-id"></code>
+        </div>
+        <div class="status-item">
+          <span class="status-label">Status:</span>
+          <span id="status-badge" class="badge"></span>
+        </div>
+        <div class="status-item">
+          <span class="status-label">Revisions:</span>
+          <span id="display-revision-count" class="meta-value">0</span>
+        </div>
+      </div>
+
+      <!-- Validator Findings Alert Box -->
+      <div id="validator-box" class="alert alert-info hidden">
+        <h3>Validation Findings</h3>
+        <ul id="validator-issues-list" class="issues-list"></ul>
+      </div>
+
+      <!-- Research Warnings Box -->
+      <div id="warnings-box" class="alert alert-warning hidden">
+        <h3>Research Notes & Warnings</h3>
+        <ul id="warnings-list" class="warnings-list"></ul>
+      </div>
+
+      <!-- Plan Summary Card -->
+      <div class="card summary-card">
+        <div class="summary-header">
+          <h2 id="itinerary-title">Draft Itinerary</h2>
+          <div class="cost-badge" id="total-cost-badge"></div>
+        </div>
+        <p id="itinerary-summary" class="summary-text"></p>
+        <div id="budget-breakdown" class="budget-breakdown hidden"></div>
+      </div>
+
+      <!-- Day-by-Day Schedule -->
+      <div id="days-container" class="days-container"></div>
+
+      <!-- Review Controls (visible when awaiting review) -->
+      <section id="review-controls" class="card review-card hidden">
+        <h2>Human Review & Decision</h2>
+        <p class="review-desc">Review the drafted schedule above. You can approve this itinerary, reject it with feedback for revision, or request specific modifications.</p>
+
+        <div class="review-grid">
+          <!-- Approve -->
+          <div class="review-action-block">
+            <h3>Approve Itinerary</h3>
+            <p>Accept this itinerary as final. The plan will be locked and finalized.</p>
+            <button id="btn-approve" class="btn btn-success">Approve Plan</button>
+          </div>
+
+          <!-- Reject with Feedback -->
+          <div class="review-action-block">
+            <h3>Reject with Feedback</h3>
+            <label for="reject-feedback">Feedback (Required):</label>
+            <textarea id="reject-feedback" rows="3" placeholder="Explain what needs to be changed in the next draft..."></textarea>
+            <button id="btn-reject" class="btn btn-danger">Reject & Request Revision</button>
+          </div>
+
+          <!-- Modify with Instructions -->
+          <div class="review-action-block">
+            <h3>Request Modifications</h3>
+            <label for="modify-instructions">Specific Instructions (Required):</label>
+            <textarea id="modify-instructions" rows="3" placeholder="e.g. Replace day 2 afternoon with a cooking workshop..."></textarea>
+            <button id="btn-modify" class="btn btn-secondary">Submit Modifications</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- Finalized Banner & Actions -->
+      <div id="finalized-box" class="alert alert-success hidden">
+        <h3>Plan Finalized!</h3>
+        <p>This travel itinerary has been approved and finalized.</p>
+        <button id="btn-view-final" class="btn btn-primary">Refresh Final Itinerary</button>
+      </div>
+
+      <!-- Revision Limit Reached Banner -->
+      <div id="revision-limit-box" class="alert alert-error hidden">
+        <h3>Revision Limit Reached</h3>
+        <p>This itinerary has reached the maximum threshold of 3 revisions without approval. Execution has ended.</p>
+      </div>
+    </section>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

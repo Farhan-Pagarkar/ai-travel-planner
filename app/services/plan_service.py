@@ -5,6 +5,7 @@ from typing import Any
 from fastapi import HTTPException, status
 from langgraph.types import Command
 
+from app.agents.planner import _sanitize_error_message
 from app.schemas.request import TravelRequest
 from app.schemas.review import HumanReviewInput
 
@@ -14,9 +15,26 @@ def create_plan(graph: Any, request: TravelRequest) -> dict[str, Any]:
     plan_id = str(uuid.uuid4())
     config = {"configurable": {"thread_id": plan_id}}
 
-    # Invoke graph up to the interrupt
-    graph.invoke({"request": request.model_dump(mode="json")}, config=config)
+    try:
+        # Invoke graph up to the interrupt
+        graph.invoke({"request": request.model_dump(mode="json")}, config=config)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        clean_msg = _sanitize_error_message(str(exc))
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Unable to generate travel plan: {clean_msg}",
+        ) from None
+
     state = graph.get_state(config)
+
+    if state.values.get("status") == "error":
+        errors = state.values.get("errors", ["Request validation error"])
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Validation failed: {'; '.join(errors)}",
+        )
 
     return {
         "plan_id": plan_id,
@@ -70,7 +88,16 @@ def review_plan(graph: Any, plan_id: str, review: HumanReviewInput) -> dict[str,
 
     # Resume graph with review payload
     review_payload = review.model_dump(mode="json")
-    graph.invoke(Command(resume=review_payload), config=config)
+    try:
+        graph.invoke(Command(resume=review_payload), config=config)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        clean_msg = _sanitize_error_message(str(exc))
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Unable to revise travel plan: {clean_msg}",
+        ) from None
 
     updated_state = graph.get_state(config)
     return {
