@@ -1,8 +1,5 @@
-"""Node functions for the AI Travel Planner LangGraph workflow."""
-
 from typing import Any
 from langgraph.types import interrupt
-
 from app.agents.itinerary_validator import run_itinerary_validator
 from app.agents.planner import run_planner_agent
 from app.agents.researcher import run_researcher_agent
@@ -12,7 +9,7 @@ from app.schemas.review import HumanReviewInput
 
 
 def validate_request(state: TravelPlanState) -> dict[str, Any]:
-    """Validate incoming travel request schema and constraints."""
+    #Validate incoming travel request schema and constraints
     raw_request = state.get("request", {})
     try:
         validated = TravelRequest.model_validate(raw_request)
@@ -32,7 +29,7 @@ def validate_request(state: TravelPlanState) -> dict[str, Any]:
 
 
 def research_agent(state: TravelPlanState) -> dict[str, Any]:
-    """Collect destination information, weather, and top attractions."""
+    # Collect destination information, weather, and top attractions
     request = state["request"]
     research = run_researcher_agent(request)
     return {
@@ -43,7 +40,7 @@ def research_agent(state: TravelPlanState) -> dict[str, Any]:
 
 
 def planner_agent(state: TravelPlanState) -> dict[str, Any]:
-    """Generate initial structured day-by-day itinerary."""
+    #Generate initial structured day-by-day itinerary
     request = state["request"]
     research = state.get("research_results")
     draft = run_planner_agent(
@@ -59,7 +56,7 @@ def planner_agent(state: TravelPlanState) -> dict[str, Any]:
 
 
 def itinerary_validator(state: TravelPlanState) -> dict[str, Any]:
-    """Validate itinerary constraints, dates, and budget adherence."""
+    #Validate itinerary constraints, dates, and budget adherence
     request = state["request"]
     draft = state.get("draft_itinerary")
     research = state.get("research_results")
@@ -76,7 +73,7 @@ def itinerary_validator(state: TravelPlanState) -> dict[str, Any]:
 
 
 def mark_awaiting_review(state: TravelPlanState) -> dict[str, Any]:
-    """Flag workflow as awaiting human review."""
+    #Flag workflow as awaiting human review
     return {
         "status": "awaiting_review",
         "workflow_stage": "awaiting_review",
@@ -84,10 +81,8 @@ def mark_awaiting_review(state: TravelPlanState) -> dict[str, Any]:
 
 
 def human_review(state: TravelPlanState) -> dict[str, Any]:
-    """Pause workflow for human review via LangGraph interrupt().
-
-    Resumed with Command(resume=review_payload).
-    """
+    #Pause workflow for human review via LangGraph interrupt()
+    #Resumed with Command(resume=review_payload)
     review_data = interrupt({
         "message": "Itinerary ready for review",
         "draft_itinerary": state.get("draft_itinerary"),
@@ -108,7 +103,7 @@ def human_review(state: TravelPlanState) -> dict[str, Any]:
 
 
 def revise_itinerary(state: TravelPlanState) -> dict[str, Any]:
-    """Revise draft itinerary incorporating review feedback or modifications."""
+    #Revise draft itinerary incorporating review feedback or modifications.
     current_revisions = state.get("revision_count", 0)
     new_revisions = current_revisions + 1
     request = state["request"]
@@ -132,7 +127,7 @@ def revise_itinerary(state: TravelPlanState) -> dict[str, Any]:
 
 
 def finalize_plan(state: TravelPlanState) -> dict[str, Any]:
-    """Finalize approved itinerary for delivery."""
+    #Finalize approved itinerary for delivery.
     return {
         "final_itinerary": state.get("draft_itinerary"),
         "status": "finalized",
@@ -141,7 +136,7 @@ def finalize_plan(state: TravelPlanState) -> dict[str, Any]:
 
 
 def mark_revision_limit(state: TravelPlanState) -> dict[str, Any]:
-    """Terminate workflow when maximum revisions threshold is reached without approval."""
+    #Terminate workflow when maximum revisions threshold is reached without approval
     return {
         "status": "revision_limit_reached",
         "workflow_stage": "ended_revision_limit",

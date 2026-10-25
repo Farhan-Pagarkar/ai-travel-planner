@@ -1,9 +1,6 @@
-"""LangGraph workflow definition and compilation for the AI Travel Planner."""
-
 from typing import Literal, Optional
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
-
 from app.graph.nodes import (
     finalize_plan,
     human_review,
@@ -21,7 +18,7 @@ MAX_REVISIONS = 3
 
 
 def route_request_validation(state: TravelPlanState) -> Literal["research_agent", "end"]:
-    """Route after request validation: proceed if valid, terminate on error."""
+    #Route after request validation: proceed if valid, terminate on error.
     if state.get("errors"):
         return "end"
     return "research_agent"
@@ -30,7 +27,7 @@ def route_request_validation(state: TravelPlanState) -> Literal["research_agent"
 def route_after_human_review(
     state: TravelPlanState,
 ) -> Literal["finalize_plan", "revise_itinerary", "mark_revision_limit"]:
-    """Route after human review: finalize on approve, revise on reject/modify up to limit."""
+    #Route after human review: finalize on approve, revise on reject/modify up to limit.
     action = state.get("review_action")
     if action == "approve":
         return "finalize_plan"
@@ -42,10 +39,8 @@ def route_after_human_review(
 
 
 def create_travel_planner_graph(checkpointer: Optional[BaseCheckpointSaver] = None):
-    """Build and compile the travel planner StateGraph.
-
-    The checkpointer lifecycle is managed by the caller.
-    """
+    # Build and compile the travel planner StateGraph.
+    # The checkpointer lifecycle is managed by the caller.
     builder = StateGraph(TravelPlanState)
 
     # 1. Register nodes

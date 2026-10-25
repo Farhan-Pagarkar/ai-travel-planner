@@ -434,3 +434,121 @@ def test_validator_integration_with_workflow_human_review_payload(sample_request
     # The valid mock draft produces an empty or clean list of issues
     assert payload["draft_itinerary"] is not None
     assert payload["revision_count"] == 0
+
+
+def test_validator_detects_mismatched_activity_name_with_valid_id_and_url(
+    sample_request, sample_research, valid_itinerary
+):
+    """Validator Agent catches when a valid candidate ID and URL are used for an unrelated activity name."""
+    itin = json.loads(json.dumps(valid_itinerary))
+    # attr-1 in sample_research is 'Kiyomizu-dera Temple', with url 'https://example.com/kiyomizu'
+    itin["days"][0]["activities"][0]["name"] = "Completely Fabricated Theme Park"
+    itin["days"][0]["activities"][0]["candidate_id"] = "attr-1"
+    itin["days"][0]["activities"][0]["source_url"] = "https://example.com/kiyomizu"
+
+    issues = _run_deterministic_checks(
+        request=sample_request,
+        draft_itinerary=itin,
+        research=sample_research,
+    )
+
+    assert any(
+        "Day 1 activity 'Completely Fabricated Theme Park' does not match verified candidate 'attr-1' name 'Kiyomizu-dera Temple'" in issue
+        for issue in issues
+    )
+
+
+def test_validator_detects_missing_destination_and_currency(
+    sample_request, sample_research, valid_itinerary
+):
+    """Missing destination or currency in request or draft itinerary must be flagged rather than treated as valid."""
+    # 1. Missing request destination
+    req_no_dest = dict(sample_request)
+    req_no_dest["destination"] = ""
+    issues = _run_deterministic_checks(
+        request=req_no_dest,
+        draft_itinerary=valid_itinerary,
+        research=sample_research,
+    )
+    assert any("Travel request destination is missing" in i for i in issues)
+
+    # 2. Missing itinerary destination
+    itin_no_dest = json.loads(json.dumps(valid_itinerary))
+    itin_no_dest["destination"] = ""
+    issues = _run_deterministic_checks(
+        request=sample_request,
+        draft_itinerary=itin_no_dest,
+        research=sample_research,
+    )
+    assert any("Itinerary destination is missing" in i for i in issues)
+
+    # 3. Missing request currency
+    req_no_curr = dict(sample_request)
+    req_no_curr["currency"] = ""
+    issues = _run_deterministic_checks(
+        request=req_no_curr,
+        draft_itinerary=valid_itinerary,
+        research=sample_research,
+    )
+    assert any("Travel request currency is missing" in i for i in issues)
+
+    # 4. Missing itinerary currency
+    itin_no_curr = json.loads(json.dumps(valid_itinerary))
+    itin_no_curr["currency"] = ""
+    issues = _run_deterministic_checks(
+        request=sample_request,
+        draft_itinerary=itin_no_curr,
+        research=sample_research,
+    )
+    assert any("Itinerary currency is missing" in i for i in issues)
+
+
+def test_validator_detects_malformed_day_dates(
+    sample_request, sample_research, valid_itinerary
+):
+    """Malformed or invalid ISO date values in itinerary days must be reported safely."""
+    itin = json.loads(json.dumps(valid_itinerary))
+    itin["days"][0]["date"] = "not-a-valid-date"
+
+    issues = _run_deterministic_checks(
+        request=sample_request,
+        draft_itinerary=itin,
+        research=sample_research,
+    )
+
+    assert any("Day 1 has malformed or missing date: 'not-a-valid-date'" in i for i in issues)
+
+
+def test_validator_detects_non_finite_and_boolean_monetary_values(
+    sample_request, sample_research, valid_itinerary
+):
+    """Non-finite floats (NaN, Inf) and boolean values must be rejected in budget and costs."""
+    # 1. Non-finite budget
+    req_bad_budget = dict(sample_request)
+    req_bad_budget["total_trip_budget"] = float("inf")
+    issues = _run_deterministic_checks(
+        request=req_bad_budget,
+        draft_itinerary=valid_itinerary,
+        research=sample_research,
+    )
+    assert any("Invalid total trip budget 'inf'" in i for i in issues)
+
+    # 2. Boolean in cost
+    itin_bool_cost = json.loads(json.dumps(valid_itinerary))
+    itin_bool_cost["days"][0]["activities"][0]["estimated_cost"] = True
+    issues = _run_deterministic_checks(
+        request=sample_request,
+        draft_itinerary=itin_bool_cost,
+        research=sample_research,
+    )
+    assert any("has invalid estimated_cost 'True'" in i for i in issues)
+
+    # 3. NaN in total_estimated_cost
+    itin_nan_cost = json.loads(json.dumps(valid_itinerary))
+    itin_nan_cost["total_estimated_cost"] = float("nan")
+    issues = _run_deterministic_checks(
+        request=sample_request,
+        draft_itinerary=itin_nan_cost,
+        research=sample_research,
+    )
+    assert any("Invalid total estimated cost 'nan'" in i for i in issues)

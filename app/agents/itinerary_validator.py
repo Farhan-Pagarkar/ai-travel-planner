@@ -1,19 +1,11 @@
-"""Itinerary Validator Agent module.
-
-Combines deterministic grounding and constraint checks with Groq-powered
-advisory quality review. Provides actionable feedback to the human reviewer
-without automatically mutating or approving itineraries.
-"""
-
 from datetime import date, datetime, timedelta
 import json
 import math
 from typing import Any, Optional
 from groq import Groq
-
 from app.config import get_groq_api_key, get_groq_model
 from app.schemas.research import ResearchResult
-from app.tools.activities import ActivityCandidate, lookup_activity_candidates
+from app.tools.activities import ActivityCandidate, is_matching_activity_name, lookup_activity_candidates, normalize_activity_name
 
 GENERIC_CATEGORIES = {
     "meal", "dining", "food", "lunch", "dinner", "breakfast",
@@ -28,7 +20,6 @@ ATTRACTION_EVENT_CATEGORIES = {
 
 
 def _parse_iso_date(val: Any) -> Optional[date]:
-    """Parse date safely from date, datetime, or ISO string."""
     if isinstance(val, date):
         return val
     if isinstance(val, datetime):
@@ -40,8 +31,7 @@ def _parse_iso_date(val: Any) -> Optional[date]:
 
 
 def _parse_safe_float(val: Any) -> Optional[float]:
-    """Parse float safely, rejecting None, non-numbers, NaN, and infinity."""
-    if val is None:
+    if val is None or isinstance(val, bool):
         return None
     try:
         f = float(val)
@@ -57,7 +47,6 @@ def _run_deterministic_checks(
     draft_itinerary: dict[str, Any],
     research: Optional[dict[str, Any]] = None,
 ) -> list[str]:
-    """Perform deterministic date, duration, budget, and grounding checks."""
     issues: list[str] = []
 
     # 1. Date coverage, sequential day numbers, and duration
@@ -108,26 +97,42 @@ def _run_deterministic_checks(
                 issues.append(
                     f"[ERROR] Day numbering error: day at index {idx} has day number {actual_num}, expected {expected_num}."
                 )
+            raw_day_date = day.get("date")
+            if not raw_day_date or not _parse_iso_date(raw_day_date):
+                issues.append(
+                    f"[ERROR] Day {expected_num} has malformed or missing date: '{raw_day_date}'."
+                )
 
     # 2. Destination and currency matching
-    req_dest = str(request.get("destination", "")).strip()
-    itin_dest = str(draft_itinerary.get("destination", "")).strip()
-    if req_dest and itin_dest and req_dest.lower() != itin_dest.lower():
+    req_dest = request.get("destination")
+    itin_dest = draft_itinerary.get("destination")
+    if not req_dest or not str(req_dest).strip():
+        issues.append("[ERROR] Travel request destination is missing.")
+    if not itin_dest or not str(itin_dest).strip():
+        issues.append("[ERROR] Itinerary destination is missing.")
+    elif req_dest and itin_dest and str(req_dest).strip().lower() != str(itin_dest).strip().lower():
         issues.append(
-            f"[ERROR] Destination mismatch: itinerary destination '{itin_dest}' does not match requested destination '{req_dest}'."
+            f"[ERROR] Destination mismatch: itinerary destination '{str(itin_dest).strip()}' does not match requested destination '{str(req_dest).strip()}'."
         )
 
-    req_curr = str(request.get("currency", "USD")).strip().upper()
-    itin_curr = str(draft_itinerary.get("currency", "USD")).strip().upper()
-    if req_curr and itin_curr and req_curr != itin_curr:
+    req_curr = request.get("currency")
+    itin_curr = draft_itinerary.get("currency")
+    if not req_curr or not str(req_curr).strip():
+        issues.append("[ERROR] Travel request currency is missing.")
+    if not itin_curr or not str(itin_curr).strip():
+        issues.append("[ERROR] Itinerary currency is missing.")
+    elif req_curr and itin_curr and str(req_curr).strip().upper() != str(itin_curr).strip().upper():
         issues.append(
-            f"[ERROR] Currency mismatch: itinerary currency '{itin_curr}' does not match requested currency '{req_curr}'."
+            f"[ERROR] Currency mismatch: itinerary currency '{str(itin_curr).strip().upper()}' does not match requested currency '{str(req_curr).strip().upper()}'."
         )
 
     # 3. Monetary value safety, cost arithmetic, and budget ceiling
     raw_total_budget = request.get("total_trip_budget")
     parsed_total_budget = _parse_safe_float(raw_total_budget)
     if parsed_total_budget is None or parsed_total_budget <= 0:
+        issues.append(
+            f"[ERROR] Invalid total trip budget '{raw_total_budget}': must be a finite, positive number."
+        )
         parsed_total_budget = 0.0
 
     raw_total_cost = draft_itinerary.get("total_estimated_cost")
@@ -250,10 +255,15 @@ def _run_deterministic_checks(
                         f"[ERROR] Day {day_num} activity '{act_name}' references unknown candidate ID '{cand_id}'."
                     )
                 else:
-                    expected_url = valid_candidates[cand_id].source_url
+                    cand = valid_candidates[cand_id]
+                    expected_url = cand.source_url
                     if source_url != expected_url:
                         issues.append(
                             f"[ERROR] Day {day_num} activity '{act_name}' has source URL '{source_url}' which does not match verified candidate '{cand_id}' URL '{expected_url}'."
+                        )
+                    if not is_matching_activity_name(act_name, cand.name):
+                        issues.append(
+                            f"[ERROR] Day {day_num} activity '{act_name}' does not match verified candidate '{cand_id}' name '{cand.name}'."
                         )
             else:
                 if source_url:
@@ -282,7 +292,6 @@ def _run_groq_quality_review(
     groq_client: Optional[Groq] = None,
     groq_model: Optional[str] = None,
 ) -> list[str]:
-    """Perform advisory quality and feasibility review using Groq in JSON mode."""
     model = groq_model or get_groq_model()
 
     if groq_client is None:
@@ -430,11 +439,6 @@ def run_itinerary_validator(
     groq_client: Optional[Groq] = None,
     groq_model: Optional[str] = None,
 ) -> list[str]:
-    """Validate draft itinerary constraints, grounding, and qualitative feasibility.
-
-    Combines deterministic rules (dates, math, candidate IDs, URLs) with
-    advisory Groq review for schedule feasibility, safety, and weather.
-    """
     if not draft_itinerary or not isinstance(draft_itinerary, dict):
         return ["[ERROR] No draft itinerary found to validate."]
 

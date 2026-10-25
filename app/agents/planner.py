@@ -9,13 +9,13 @@ from groq import Groq
 from app.config import get_groq_api_key, get_groq_model
 from app.schemas.itinerary import Itinerary
 from app.schemas.research import ResearchResult
-from app.tools.activities import ActivityCandidate, lookup_activity_candidates
+from app.tools.activities import ActivityCandidate, is_matching_activity_name, lookup_activity_candidates, normalize_activity_name
 from app.tools.budget import calculate_budget_allocation
 
 
 def _parse_safe_float(val: Any) -> Optional[float]:
-    """Parse a float safely, rejecting None, non-numbers, NaN, and infinity."""
-    if val is None:
+    """Parse a float safely, rejecting None, booleans, non-numbers, NaN, and infinity."""
+    if val is None or isinstance(val, bool):
         return None
     try:
         f = float(val)
@@ -31,8 +31,8 @@ Your task is to construct a structured, day-by-day travel itinerary grounded str
 CRITICAL GROUNDING AND VALIDATION RULES:
 1. Cover every single calendar date from start_date to end_date inclusively, in exact chronological order without gaps or duplicate dates.
 2. For all named attractions and upcoming events, you MUST select a candidate from the provided CANDIDATE ACTIVITIES list.
-3. For each selected candidate, copy its exact "id" into candidate_id and its exact "source_url" into source_url.
-4. NEVER invent attraction names, venue names, event dates, candidate IDs, or source URLs.
+3. For each selected candidate, copy its exact "id" into candidate_id, its exact "source_url" into source_url, and use its exact candidate name for the activity name.
+4. NEVER invent attraction names, venue names, event dates, candidate IDs, or source URLs. Never use a candidate ID/URL with an unrelated activity name.
 5. Generic meals, rest periods, transit, and free-time blocks must have candidate_id: null and source_url: null. Do not invent restaurant names or claim generic activities are verified venues.
 6. The sum of all activity estimated_cost values for a day must equal that day's estimated_cost.
 7. The sum of all daily estimated_cost values must equal total_estimated_cost.
@@ -117,6 +117,8 @@ def _validate_itinerary_grounding(
     expected_dates: list[str],
     max_budget: float,
     valid_candidates: dict[str, ActivityCandidate],
+    destination: Optional[str] = None,
+    currency: Optional[str] = None,
 ) -> list[str]:
     """Perform deterministic grounding and math checks on synthesized itinerary.
 
@@ -126,6 +128,25 @@ def _validate_itinerary_grounding(
 
     if not isinstance(itinerary_data, dict):
         return ["Itinerary data must be a JSON object."]
+
+    # Destination and currency checks
+    if destination is not None:
+        itin_dest = str(itinerary_data.get("destination", "")).strip()
+        if not itin_dest:
+            errors.append("Itinerary destination is missing.")
+        elif itin_dest.lower() != destination.strip().lower():
+            errors.append(
+                f"Itinerary destination '{itin_dest}' does not match requested destination '{destination.strip()}'."
+            )
+
+    if currency is not None:
+        itin_curr = str(itinerary_data.get("currency", "")).strip().upper()
+        if not itin_curr:
+            errors.append("Itinerary currency is missing.")
+        elif itin_curr != currency.strip().upper():
+            errors.append(
+                f"Itinerary currency '{itin_curr}' does not match requested currency '{currency.strip().upper()}'."
+            )
 
     # 1. Date coverage and order checks
     days = itinerary_data.get("days", [])
@@ -139,6 +160,17 @@ def _validate_itinerary_grounding(
 
     if len(set(actual_dates)) != len(actual_dates):
         errors.append("Duplicate day dates detected in itinerary.")
+
+    for d in days:
+        if isinstance(d, dict):
+            raw_d = d.get("date")
+            if not raw_d or not isinstance(raw_d, str):
+                errors.append(f"Day {d.get('day', '?')} has malformed or missing date: {raw_d}.")
+            else:
+                try:
+                    date.fromisoformat(raw_d.strip())
+                except Exception:
+                    errors.append(f"Day {d.get('day', '?')} has malformed date format: {raw_d}.")
 
     GENERIC_CATEGORIES = {
         "meal", "dining", "food", "lunch", "dinner", "breakfast",
@@ -190,10 +222,15 @@ def _validate_itinerary_grounding(
                         f"Activity '{act_name}' on Day {day_num} references unknown candidate ID '{cand_id}'. Must select from provided candidate IDs."
                     )
                 else:
-                    expected_url = valid_candidates[cand_id].source_url
+                    cand = valid_candidates[cand_id]
+                    expected_url = cand.source_url
                     if source_url != expected_url:
                         errors.append(
                             f"Activity '{act_name}' on Day {day_num} has source URL '{source_url}' that does not match candidate '{cand_id}' URL '{expected_url}'."
+                        )
+                    if not is_matching_activity_name(act_name, cand.name):
+                        errors.append(
+                            f"Activity '{act_name}' on Day {day_num} does not match candidate '{cand_id}' name '{cand.name}'."
                         )
             else:
                 if source_url:
@@ -384,6 +421,8 @@ def run_planner_agent(
         expected_dates=expected_dates,
         max_budget=total_budget,
         valid_candidates=valid_candidates,
+        destination=destination,
+        currency=currency,
     )
 
     # Attempt 2: Bounded single correction attempt if validation failed
@@ -416,6 +455,8 @@ def run_planner_agent(
             expected_dates=expected_dates,
             max_budget=total_budget,
             valid_candidates=valid_candidates,
+            destination=destination,
+            currency=currency,
         )
         if errors:
             raise RuntimeError(

@@ -143,7 +143,7 @@ def mock_planner_in_workflow_tests(request, monkeypatch):
 
                 acts = [
                     {
-                        "name": f"Morning {interest.title()} Tour",
+                        "name": "Fushimi Inari Shrine",
                         "description": f"Morning visit in {dest} focusing on {interest}.",
                         "category": "attraction",
                         "start_time": "09:00 AM",

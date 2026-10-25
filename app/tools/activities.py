@@ -2,6 +2,49 @@
 
 from dataclasses import dataclass, field
 from typing import Any, Optional
+from urllib.parse import urlparse
+
+
+def normalize_activity_name(name: Any) -> str:
+    """Normalize activity name for strict, consistent comparison."""
+    if not name:
+        return ""
+    cleaned = (
+        str(name)
+        .strip("'\"")
+        .strip("'\"")
+        .replace("–", "-")
+        .replace("—", "-")
+        .replace("’", "'")
+        .replace("`", "'")
+        .replace("“", '"')
+        .replace("”", '"')
+    )
+    return " ".join(cleaned.lower().split())
+
+
+def is_matching_activity_name(name1: Any, name2: Any) -> bool:
+    """Compare two activity names strictly using case-insensitive whitespace normalization.
+
+    Disallows fuzzy matching that could permit unrelated attractions to match.
+    """
+    norm1 = normalize_activity_name(name1)
+    norm2 = normalize_activity_name(name2)
+    return bool(norm1 and norm2 and norm1 == norm2)
+
+
+def is_valid_candidate_url(url: Any) -> bool:
+    """Validate that a candidate URL is an absolute HTTP or HTTPS URL."""
+    if not url or not isinstance(url, str):
+        return False
+    trimmed = url.strip()
+    if not trimmed:
+        return False
+    try:
+        parsed = urlparse(trimmed)
+        return parsed.scheme.lower() in ("http", "https") and bool(parsed.netloc.strip())
+    except Exception:
+        return False
 
 
 @dataclass
@@ -97,8 +140,8 @@ def lookup_activity_candidates(
         name = str(item.get("name", "")).strip()
         source_url = item.get("source_url")
 
-        # Exclude candidates without verified source URLs or names
-        if not name or not source_url or not str(source_url).strip():
+        # Exclude candidates without verified names or absolute HTTP(S) source URLs
+        if not name or not is_valid_candidate_url(source_url):
             continue
 
         url_str = str(source_url).strip()
@@ -135,7 +178,8 @@ def lookup_activity_candidates(
         title = str(item.get("title", "")).strip()
         source_url = item.get("source_url")
 
-        if not title or not source_url or not str(source_url).strip():
+        # Exclude events without verified titles or absolute HTTP(S) source URLs
+        if not title or not is_valid_candidate_url(source_url):
             continue
 
         url_str = str(source_url).strip()

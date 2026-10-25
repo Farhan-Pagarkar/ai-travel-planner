@@ -697,3 +697,225 @@ def test_insufficient_research_does_not_fabricate_attractions():
     # Check that warning about insufficient research was added
     assert any("Insufficient verified activity candidates" in w for w in result["warnings"])
     assert result["days"][0]["activities"][0]["candidate_id"] is None
+
+
+def test_activity_lookup_rejects_missing_malformed_and_unsupported_schemes():
+    """Candidates with missing, malformed, or non-http(s) URL schemes must be excluded."""
+    research_with_bad_urls = {
+        "attractions": [
+            {"name": "No URL Attraction", "source_url": None, "description": "Desc"},
+            {"name": "Empty URL Attraction", "source_url": "   ", "description": "Desc"},
+            {"name": "FTP Scheme Attraction", "source_url": "ftp://files.example.com/item", "description": "Desc"},
+            {"name": "Javascript Scheme Attraction", "source_url": "javascript:alert(1)", "description": "Desc"},
+            {"name": "Relative Path Attraction", "source_url": "/attractions/view", "description": "Desc"},
+            {"name": "No Scheme Domain Attraction", "source_url": "example.com/site", "description": "Desc"},
+            {"name": "Malformed Scheme Attraction", "source_url": "http://", "description": "Desc"},
+            {"name": "Valid HTTPS Attraction", "source_url": "https://example.com/valid", "description": "Desc"},
+            {"name": "Valid HTTP Attraction", "source_url": "http://example.com/also-valid", "description": "Desc"},
+        ],
+        "upcoming_local_events": [
+            {"title": "No URL Event", "source_url": "", "summary": "Sum"},
+            {"title": "File Scheme Event", "source_url": "file:///path/to/event", "summary": "Sum"},
+            {"title": "Valid HTTPS Event", "source_url": "https://example.com/event", "summary": "Sum"},
+        ],
+    }
+
+    result = lookup_activity_candidates(research_data=research_with_bad_urls)
+    assert len(result.candidates) == 3
+    extracted_names = [c.name for c in result.candidates]
+    assert "Valid HTTPS Attraction" in extracted_names
+    assert "Valid HTTP Attraction" in extracted_names
+    assert "Valid HTTPS Event" in extracted_names
+    assert "FTP Scheme Attraction" not in extracted_names
+    assert "Javascript Scheme Attraction" not in extracted_names
+    assert "Relative Path Attraction" not in extracted_names
+
+
+def test_planner_grounding_detects_mismatched_activity_name():
+    """Grounding validation catches valid candidate ID and URL used with unrelated attraction name."""
+    cand = ActivityCandidate(
+        id="attr-1",
+        name="Kyoto Temple",
+        description="Historic temple",
+        category="attraction",
+        source_url="https://example.com/kyoto",
+    )
+    valid_candidates = {"attr-1": cand}
+
+    itinerary_with_disguised_attraction = {
+        "total_estimated_cost": 50.0,
+        "days": [
+            {
+                "day": 1,
+                "date": "2026-11-01",
+                "activities": [
+                    {
+                        "name": "Disguised Unrelated Theme Park",
+                        "estimated_cost": 50.0,
+                        "candidate_id": "attr-1",
+                        "source_url": "https://example.com/kyoto",
+                        "category": "attraction",
+                    }
+                ],
+                "estimated_cost": 50.0,
+            }
+        ],
+    }
+
+    errors = _validate_itinerary_grounding(
+        itinerary_data=itinerary_with_disguised_attraction,
+        expected_dates=["2026-11-01"],
+        max_budget=500.0,
+        valid_candidates=valid_candidates,
+    )
+
+    assert any("does not match candidate 'attr-1' name 'Kyoto Temple'" in err for err in errors)
+
+
+def test_planner_agent_retries_and_corrects_mismatched_activity_name(sample_research_data):
+    """Planner Agent triggers bounded correction retry when LLM disguises attraction name."""
+    mock_groq = MagicMock()
+
+    # Attempt 1: Valid ID and URL but mismatched attraction name
+    bad_attempt = {
+        "destination": "Kyoto, Japan",
+        "total_days": 1,
+        "currency": "USD",
+        "total_estimated_cost": 100.0,
+        "days": [
+            {
+                "day": 1,
+                "date": "2026-11-01",
+                "focus": "sightseeing",
+                "theme": "sightseeing",
+                "activities": [
+                    {
+                        "name": "Fabricated Disguised Rollercoaster",
+                        "description": "Fun ride.",
+                        "category": "attraction",
+                        "start_time": "09:00 AM",
+                        "estimated_duration": "3 hours",
+                        "estimated_cost": 100.0,
+                        "candidate_id": "attr-1",
+                        "source_url": "https://example.com/fushimi",
+                    }
+                ],
+                "estimated_cost": 100.0,
+            }
+        ],
+        "summary": "1-day trip.",
+        "assumptions": [],
+        "warnings": [],
+    }
+
+    # Attempt 2: Corrected attraction name matching candidate
+    corrected_attempt = {
+        "destination": "Kyoto, Japan",
+        "total_days": 1,
+        "currency": "USD",
+        "total_estimated_cost": 100.0,
+        "days": [
+            {
+                "day": 1,
+                "date": "2026-11-01",
+                "focus": "sightseeing",
+                "theme": "sightseeing",
+                "activities": [
+                    {
+                        "name": "Fushimi Inari Shrine",
+                        "description": "Historic shrine.",
+                        "category": "attraction",
+                        "start_time": "09:00 AM",
+                        "estimated_duration": "3 hours",
+                        "estimated_cost": 100.0,
+                        "candidate_id": "attr-1",
+                        "source_url": "https://example.com/fushimi",
+                    }
+                ],
+                "estimated_cost": 100.0,
+            }
+        ],
+        "summary": "1-day trip.",
+        "assumptions": [],
+        "warnings": [],
+    }
+
+    choice1 = MagicMock()
+    choice1.message.content = json.dumps(bad_attempt)
+    choice2 = MagicMock()
+    choice2.message.content = json.dumps(corrected_attempt)
+
+    mock_groq.chat.completions.create.side_effect = [
+        MagicMock(choices=[choice1]),
+        MagicMock(choices=[choice2]),
+    ]
+
+    request = {
+        "destination": "Kyoto, Japan",
+        "start_date": "2026-11-01",
+        "end_date": "2026-11-01",
+        "total_trip_budget": 500.0,
+    }
+
+    result = run_planner_agent(
+        request=request,
+        research=sample_research_data,
+        groq_client=mock_groq,
+    )
+
+    assert mock_groq.chat.completions.create.call_count == 2
+    assert result["days"][0]["activities"][0]["name"] == "Fushimi Inari Shrine"
+
+
+def test_planner_agent_fails_when_name_mismatch_persists_after_correction(sample_research_data):
+    """Planner Agent raises RuntimeError if mismatched activity name is not corrected."""
+    mock_groq = MagicMock()
+
+    bad_attempt = {
+        "destination": "Kyoto, Japan",
+        "total_days": 1,
+        "currency": "USD",
+        "total_estimated_cost": 100.0,
+        "days": [
+            {
+                "day": 1,
+                "date": "2026-11-01",
+                "focus": "sightseeing",
+                "theme": "sightseeing",
+                "activities": [
+                    {
+                        "name": "Fabricated Rollercoaster",
+                        "description": "Fun ride.",
+                        "category": "attraction",
+                        "start_time": "09:00 AM",
+                        "estimated_duration": "3 hours",
+                        "estimated_cost": 100.0,
+                        "candidate_id": "attr-1",
+                        "source_url": "https://example.com/fushimi",
+                    }
+                ],
+                "estimated_cost": 100.0,
+            }
+        ],
+        "summary": "1-day trip.",
+        "assumptions": [],
+        "warnings": [],
+    }
+
+    choice = MagicMock()
+    choice.message.content = json.dumps(bad_attempt)
+    mock_groq.chat.completions.create.return_value = MagicMock(choices=[choice])
+
+    request = {
+        "destination": "Kyoto, Japan",
+        "start_date": "2026-11-01",
+        "end_date": "2026-11-01",
+        "total_trip_budget": 500.0,
+    }
+
+    with pytest.raises(RuntimeError, match="failed validation after correction attempt"):
+        run_planner_agent(
+            request=request,
+            research=sample_research_data,
+            groq_client=mock_groq,
+        )

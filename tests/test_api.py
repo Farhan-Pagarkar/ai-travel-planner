@@ -206,3 +206,45 @@ def test_create_plan_invalid_request_returns_422(client: TestClient):
     }
     response = client.post("/plan", json=invalid_payload)
     assert response.status_code == 422
+
+
+def test_api_enforces_revision_limit(client: TestClient, sample_payload: dict[str, Any]):
+    """After 3 revisions without approval, the workflow terminates at revision limit and cannot be finalized."""
+    create_res = client.post("/plan", json=sample_payload)
+    plan_id = create_res.json()["plan_id"]
+    assert create_res.json()["status"] == "awaiting_review"
+
+    # Revision 1
+    rev1 = client.post(f"/plan/{plan_id}/review", json={"action": "reject", "feedback": "Need more food"})
+    assert rev1.status_code == 200
+    assert rev1.json()["status"] == "awaiting_review"
+    assert rev1.json()["revision_count"] == 1
+
+    # Revision 2
+    rev2 = client.post(f"/plan/{plan_id}/review", json={"action": "reject", "feedback": "Need more walks"})
+    assert rev2.status_code == 200
+    assert rev2.json()["status"] == "awaiting_review"
+    assert rev2.json()["revision_count"] == 2
+
+    # Revision 3
+    rev3 = client.post(f"/plan/{plan_id}/review", json={"action": "reject", "feedback": "Different order"})
+    assert rev3.status_code == 200
+    assert rev3.json()["status"] == "awaiting_review"
+    assert rev3.json()["revision_count"] == 3
+
+    # Revision 4: Reaches limit (MAX_REVISIONS = 3)
+    rev4 = client.post(f"/plan/{plan_id}/review", json={"action": "reject", "feedback": "Another change"})
+    assert rev4.status_code == 200
+    data4 = rev4.json()
+    assert data4["status"] == "revision_limit_reached"
+    assert data4["workflow_stage"] == "ended_revision_limit"
+
+    # Cannot retrieve final plan
+    res_final = client.get(f"/plan/{plan_id}/final")
+    assert res_final.status_code == 409
+    assert "not finalized" in res_final.json()["detail"].lower()
+
+    # Subsequent review attempt fails with 409
+    res_after = client.post(f"/plan/{plan_id}/review", json={"action": "approve"})
+    assert res_after.status_code == 409
+    assert "not awaiting review" in res_after.json()["detail"].lower()

@@ -1,11 +1,5 @@
-"""LangGraph state definition for the AI Travel Planner workflow."""
-
 from typing import Any, Optional, TypedDict
-
-
 class TravelPlanState(TypedDict, total=False):
-    """Workflow state for travel planning and validation."""
-
     # Original travel request payload (serializable dict)
     request: dict[str, Any]
 
