@@ -1,14 +1,3 @@
-"""Tests for the Itinerary Validator Agent.
-
-Tests cover:
-- Deterministic checks: dates, duration, numbering, cost math, budget ceilings,
-  candidate grounding, source URLs, allowed generic activities, and duplicates.
-- Safe monetary parsing (negative, non-finite, string, or missing values).
-- Groq-powered advisory review for safety, weather, and schedule feasibility.
-- Resilient failure handling: preserving deterministic findings on Groq errors.
-- Integration into LangGraph human-review interrupt payload.
-"""
-
 import json
 from unittest.mock import MagicMock
 import pytest

@@ -1,5 +1,3 @@
-"""Web search tool using Serper API for Google search and news retrieval."""
-
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Optional

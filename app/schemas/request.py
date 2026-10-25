@@ -1,5 +1,3 @@
-"""Pydantic model for travel planning requests."""
-
 from datetime import date
 from typing import Any, Optional
 from pydantic import BaseModel, Field, field_validator, model_validator

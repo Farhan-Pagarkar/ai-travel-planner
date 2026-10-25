@@ -1,5 +1,3 @@
-"""Budget Calculator Tool for deterministic expense allocation and planning constraints."""
-
 from dataclasses import dataclass, field
 from typing import Any, Optional
 

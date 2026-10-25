@@ -1,5 +1,3 @@
-"""Tests for LangGraph travel planner workflow, checkpointing, and HITL interrupts."""
-
 from pathlib import Path
 from typing import Any
 import pytest

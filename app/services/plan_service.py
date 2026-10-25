@@ -1,5 +1,3 @@
-"""Service layer for executing and managing travel planning workflow state."""
-
 import uuid
 from typing import Any
 from fastapi import HTTPException, status

@@ -1,5 +1,3 @@
-"""Pydantic model for human-in-the-loop review actions."""
-
 from enum import Enum
 from typing import Optional
 from pydantic import BaseModel, Field, model_validator

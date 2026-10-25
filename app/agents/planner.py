@@ -1,5 +1,3 @@
-"""Itinerary Planner Agent module utilizing Groq, Activity Lookup Tool, and Budget Calculator Tool."""
-
 from datetime import date, datetime, timedelta
 import json
 import math

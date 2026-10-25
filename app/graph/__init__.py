@@ -1,5 +1,3 @@
-"""LangGraph workflow definition, state schemas, and checkpoints."""
-
 from app.graph.state import TravelPlanState
 from app.graph.workflow import MAX_REVISIONS, create_travel_planner_graph
 

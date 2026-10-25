@@ -1,5 +1,3 @@
-"""Weather tool integrating Open-Meteo for geocoding, forecasts, and historical climate comparisons."""
-
 from datetime import date, datetime, timedelta
 from typing import Any, Optional
 import httpx

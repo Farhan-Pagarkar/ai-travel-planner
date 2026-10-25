@@ -1,5 +1,3 @@
-"""Pydantic schemas for data validation and transfer."""
-
 from app.schemas.itinerary import Itinerary, ItineraryDay, ScheduledActivity
 from app.schemas.request import TravelRequest
 from app.schemas.research import (

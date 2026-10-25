@@ -1,5 +1,3 @@
-"""Activity Lookup Tool for extracting and ranking verified activity candidates."""
-
 from dataclasses import dataclass, field
 from typing import Any, Optional
 from urllib.parse import urlparse

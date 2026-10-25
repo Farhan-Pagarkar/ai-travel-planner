@@ -1,10 +1,8 @@
 import os
-import httpx
-import groq
-"""Unit and integration tests for Activity Lookup, Budget Calculator, and Planner Agent."""
-
 import json
 from unittest.mock import MagicMock
+import httpx
+import groq
 import pytest
 
 from app.agents.planner import PlannerError, _validate_itinerary_grounding, run_planner_agent

@@ -1,5 +1,3 @@
-"""Research Agent module utilizing Serper, Open-Meteo, and Groq."""
-
 import json
 from typing import Any, Optional
 from groq import Groq

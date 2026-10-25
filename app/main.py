@@ -1,5 +1,3 @@
-"""FastAPI application entrypoint for AI Travel Planner."""
-
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -41,6 +39,7 @@ def create_app(checkpoint_path: Optional[str] = None) -> FastAPI:
 
     @app.get("/health")
     def health_check() -> dict[str, str]:
+        """Liveness probe returning application health status."""
         return {"status": "ok"}
 
     @app.get("/favicon.ico", include_in_schema=False)

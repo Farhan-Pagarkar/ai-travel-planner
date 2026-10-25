@@ -1,5 +1,3 @@
-"""Shared pytest fixtures and test boundary mocks."""
-
 from typing import Any
 import pytest
 

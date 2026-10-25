@@ -1,5 +1,3 @@
-"""Pydantic schemas for structured travel itineraries, daily schedules, and activities."""
-
 from typing import Any, Optional
 from pydantic import BaseModel, Field, field_validator
 

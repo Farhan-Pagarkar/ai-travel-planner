@@ -1,5 +1,3 @@
-"""Pydantic schemas for the Research Agent findings and synthesized results."""
-
 from typing import Optional
 from pydantic import BaseModel, Field
 

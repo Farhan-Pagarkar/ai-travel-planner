@@ -1,5 +1,3 @@
-"""Focused unit and integration tests for web search, weather, and Research Agent."""
-
 from datetime import date, timedelta
 from typing import Any
 from unittest.mock import MagicMock

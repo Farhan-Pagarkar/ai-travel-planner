@@ -1,5 +1,4 @@
 from datetime import date, timedelta
-"""Tests for FastAPI endpoints exposing travel planning workflow."""
 
 from pathlib import Path
 from typing import Any
