@@ -89,7 +89,7 @@ class ActivityLookupResult:
         }
 
 
-def _score_candidate(candidate: ActivityCandidate, normalized_interests: list[str]) -> int:
+def score_candidate(candidate: ActivityCandidate, normalized_interests: list[str]) -> int:
     """Score candidate by counting keyword matches against traveler interests."""
     if not normalized_interests:
         return 0
@@ -105,6 +105,9 @@ def _score_candidate(candidate: ActivityCandidate, normalized_interests: list[st
                 if len(w) >= 3 and w in text:
                     score += 1
     return score
+
+
+_score_candidate = score_candidate
 
 
 def lookup_activity_candidates(

@@ -552,3 +552,147 @@ def test_validator_detects_non_finite_and_boolean_monetary_values(
         research=sample_research,
     )
     assert any("Invalid total estimated cost 'nan'" in i for i in issues)
+
+def test_validator_rejects_accounting_categories_as_activities(sample_request, sample_research):
+    """Validator detects accounting categories emitted as scheduled activities."""
+    invalid_itinerary = {
+        "destination": sample_request["destination"],
+        "total_days": 1,
+        "currency": "USD",
+        "total_estimated_cost": 250.0,
+        "days": [
+            {
+                "day": 1,
+                "date": sample_request["start_date"],
+                "focus": "Sightseeing",
+                "activities": [
+                    {
+                        "name": "Kiyomizu-dera Temple",
+                        "description": "Temple visit",
+                        "category": "attraction",
+                        "estimated_cost": 50.0,
+                        "candidate_id": "attr-1",
+                        "source_url": "https://example.com/kiyomizu",
+                    },
+                    {
+                        "name": "Accommodation",
+                        "description": "Hotel expense",
+                        "category": "accommodation",
+                        "estimated_cost": 100.0,
+                    },
+                    {
+                        "name": "Contingency",
+                        "description": "Reserve fund",
+                        "category": "contingency",
+                        "estimated_cost": 100.0,
+                    },
+                ],
+                "estimated_cost": 250.0,
+            }
+        ],
+        "summary": "Draft plan",
+        "assumptions": [],
+        "warnings": [],
+    }
+
+    issues = _run_deterministic_checks(
+        request=sample_request,
+        draft_itinerary=invalid_itinerary,
+        research=sample_research,
+    )
+
+    issue_text = " ".join(issues)
+    assert "accounting category 'Accommodation'" in issue_text
+    assert "accounting category 'Contingency'" in issue_text
+
+
+def test_validator_warns_on_contingency_encroachment(sample_request, sample_research):
+    """Validator warns when total cost encroaches into contingency reserve."""
+    itinerary_encroaching = {
+        "destination": sample_request["destination"],
+        "total_days": 1,
+        "currency": "USD",
+        "total_estimated_cost": 950.0,
+        "days": [
+            {
+                "day": 1,
+                "date": sample_request["start_date"],
+                "focus": "Exploration",
+                "activities": [
+                    {
+                        "name": "Kiyomizu-dera Temple",
+                        "description": "Temple visit",
+                        "category": "attraction",
+                        "estimated_cost": 950.0,
+                        "candidate_id": "attr-1",
+                        "source_url": "https://example.com/kiyomizu",
+                    }
+                ],
+                "estimated_cost": 950.0,
+            }
+        ],
+        "summary": "Expensive day",
+        "budget_breakdown": {
+            "total_budget": 1000.0,
+            "contingency_reserve": 100.0,
+            "available_for_planned_expenses": 900.0,
+        },
+        "assumptions": [],
+        "warnings": [],
+    }
+
+    req = dict(sample_request)
+    req["total_trip_budget"] = 1000.0
+
+    issues = _run_deterministic_checks(
+        request=req,
+        draft_itinerary=itinerary_encroaching,
+        research=sample_research,
+    )
+
+    issue_text = " ".join(issues)
+    assert "encroaches into the contingency reserve" in issue_text
+
+
+def test_validator_checks_daily_cost_breakdown(sample_request, sample_research):
+    """Validator enforces cost_breakdown consistency and rejects contingency inside it."""
+    itinerary_bad_breakdown = {
+        "destination": sample_request["destination"],
+        "total_days": 1,
+        "currency": "USD",
+        "total_estimated_cost": 50.0,
+        "days": [
+            {
+                "day": 1,
+                "date": sample_request["start_date"],
+                "focus": "Sightseeing",
+                "activities": [
+                    {
+                        "name": "Kiyomizu-dera Temple",
+                        "description": "Temple visit",
+                        "category": "attraction",
+                        "estimated_cost": 50.0,
+                        "candidate_id": "attr-1",
+                        "source_url": "https://example.com/kiyomizu",
+                    }
+                ],
+                "estimated_cost": 50.0,
+                "cost_breakdown": {
+                    "activities": 30.0,
+                    "contingency": 20.0,
+                },
+            }
+        ],
+        "summary": "Day with cost breakdown",
+        "assumptions": [],
+        "warnings": [],
+    }
+
+    issues = _run_deterministic_checks(
+        request=sample_request,
+        draft_itinerary=itinerary_bad_breakdown,
+        research=sample_research,
+    )
+
+    issue_text = " ".join(issues)
+    assert "cost_breakdown includes contingency reserve" in issue_text

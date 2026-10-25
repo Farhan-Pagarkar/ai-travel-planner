@@ -960,3 +960,34 @@ def test_complete_search_failure_raises_error():
     # Verify Groq was never called to fabricate results
     mock_groq.chat.completions.create.assert_not_called()
 
+
+
+def test_weather_intelligence_handles_past_dates_without_index_error():
+    """Verify gather_weather_intelligence handles past dates cleanly without raising IndexError: list index out of range."""
+    from app.tools.weather import gather_weather_intelligence, WeatherClient
+    from app.schemas.research import HistoricalWeatherComparison
+
+    mock_client = MagicMock(spec=WeatherClient)
+    mock_client.geocode_destination.return_value = MagicMock(latitude=35.0, longitude=135.7, timezone="Asia/Tokyo")
+    mock_client.get_historical_comparison.return_value = HistoricalWeatherComparison(
+        comparison_years=[2025, 2024],
+        typical_temp_max_c=18.0,
+        typical_temp_min_c=8.0,
+        typical_precipitation_mm=5.0,
+        rainy_days_count=1,
+        summary="Cool conditions.",
+    )
+
+    # Calling with past dates relative to reference_today
+    coords, weather = gather_weather_intelligence(
+        destination="Kyoto",
+        start_date_str="2026-04-09",
+        end_date_str="2026-04-19",
+        client=mock_client,
+        reference_today=date(2026, 10, 25),
+    )
+
+    assert weather.weather_type == "historical_comparison"
+    assert weather.historical_comparison is not None
+    assert mock_client.get_historical_comparison.called
+    assert "historical past dates" in weather.notes.lower()

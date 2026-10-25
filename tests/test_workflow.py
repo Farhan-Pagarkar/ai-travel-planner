@@ -297,3 +297,68 @@ def test_invalid_travel_request_stops_at_validation(tmp_path: Path):
         assert len(res["errors"]) > 0
         assert res.get("draft_itinerary") is None
         assert graph.get_state(config).next == ()
+
+
+def test_workflow_preserves_budget_separation_and_review_workflow(tmp_path: Path):
+    """Workflow preserves budget separation during human review, modification, and approval."""
+    from langgraph.types import Command
+    from app.agents.planner import DISALLOWED_ACCOUNTING_NAMES
+
+    db_file = tmp_path / "test_checkpoints.sqlite"
+    plan_id = "plan-budget-separation-wf-test"
+
+    request = {
+        "destination": "Kyoto, Japan",
+        "start_date": "2026-11-01",
+        "end_date": "2026-11-04",
+        "total_trip_budget": 1000.0,
+        "currency": "USD",
+        "interests": ["temples", "culture"],
+        "traveler_count": 2,
+    }
+
+    with SqliteSaver.from_conn_string(str(db_file)) as saver:
+        graph = create_travel_planner_graph(checkpointer=saver)
+        config = {"configurable": {"thread_id": plan_id}}
+
+        # 1. Start plan generation -> reaches human_review interrupt
+        res = graph.invoke({"request": request}, config=config)
+        assert res["status"] == "awaiting_review"
+        assert res["workflow_stage"] == "awaiting_review"
+
+        draft = res.get("draft_itinerary", {})
+        assert draft.get("budget_breakdown") is not None
+
+        # Verify no activities are accounting categories
+        for day in draft.get("days", []):
+            for act in day.get("activities", []):
+                act_name_lower = act["name"].lower()
+                assert act_name_lower not in DISALLOWED_ACCOUNTING_NAMES
+                assert "contingency" not in act_name_lower
+                assert act.get("category") not in {"contingency", "accommodation"}
+
+        # 2. Modify with human feedback
+        modified_res = graph.invoke(
+            Command(resume={"action": "modify", "modifications": "Add morning bike tour"}),
+            config=config,
+        )
+        assert modified_res["status"] == "awaiting_review"
+        assert modified_res["revision_count"] == 1
+
+        revised_draft = modified_res.get("draft_itinerary", {})
+        # Verify no accounting categories in revised draft
+        for day in revised_draft.get("days", []):
+            for act in day.get("activities", []):
+                act_name_lower = act["name"].lower()
+                assert act_name_lower not in DISALLOWED_ACCOUNTING_NAMES
+                assert "contingency" not in act_name_lower
+
+        # 3. Approve draft -> finalizes workflow
+        final_res = graph.invoke(
+            Command(resume={"action": "approve"}),
+            config=config,
+        )
+        assert final_res["status"] == "finalized"
+        assert final_res["workflow_stage"] == "completed"
+        assert final_res.get("final_itinerary") is not None
+        assert graph.get_state(config).next == ()

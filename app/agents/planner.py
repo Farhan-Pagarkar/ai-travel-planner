@@ -5,7 +5,7 @@ import json
 import math
 import re
 from typing import Any, Optional
-from groq import Groq
+from groq import Groq, RateLimitError
 
 from app.config import get_groq_api_key, get_groq_model
 from app.schemas.itinerary import Itinerary
@@ -15,7 +15,45 @@ from app.tools.activities import (
     is_matching_activity_name,
     lookup_activity_candidates,
     normalize_activity_name,
+    score_candidate,
 )
+
+DISALLOWED_ACCOUNTING_NAMES: set[str] = {
+    "accommodation",
+    "accommodations",
+    "lodging",
+    "hotel",
+    "hotel expense",
+    "hotel booking",
+    "hotel stay",
+    "hostel",
+    "airbnb",
+    "contingency",
+    "contingency reserve",
+    "contingency fund",
+    "reserve",
+    "emergency fund",
+    "budget reserve",
+    "local transportation",
+    "transportation",
+    "transit allowance",
+    "transport budget",
+    "food",
+    "food allowance",
+    "food budget",
+    "daily food",
+    "daily food budget",
+    "meals budget",
+    "food & dining",
+    "activities budget",
+    "activity allowance",
+}
+
+BROAD_DESTINATIONS: set[str] = {
+    "japan", "italy", "france", "spain", "germany", "united kingdom", "uk",
+    "united states", "usa", "us", "canada", "australia", "china", "india",
+    "brazil", "mexico", "greece", "thailand", "vietnam", "indonesia",
+}
 from app.tools.budget import calculate_budget_allocation
 
 
@@ -72,15 +110,33 @@ Your task is to construct a structured, day-by-day travel itinerary grounded str
 
 CRITICAL GROUNDING AND VALIDATION RULES:
 1. Cover every single calendar date from start_date to end_date inclusively, in exact chronological order without gaps or duplicate dates.
-2. For all named attractions and upcoming events, you MUST select a candidate from the provided CANDIDATE ACTIVITIES list.
+2. CANDIDATE SELECTION MANDATE: For all named attractions, temples, shrines, castles, and upcoming events, you MUST select a candidate from the provided CANDIDATE ACTIVITIES list. Make active use of all provided verified candidates across the days (aim for 1 to 2 verified candidates per day).
 3. For each selected candidate, copy its exact "id" into candidate_id, its exact "source_url" into source_url, and use its exact candidate name for the activity name.
-4. NEVER invent attraction names, venue names, event dates, candidate IDs, or source URLs. Never use a candidate ID/URL with an unrelated activity name.
-5. Generic meals, rest periods, transit, and free-time blocks must have candidate_id: null and source_url: null. Do not invent restaurant names or claim generic activities are verified venues.
-6. The sum of all activity estimated_cost values for a day must equal that day's estimated_cost.
-7. The sum of all daily estimated_cost values must equal total_estimated_cost.
-8. total_estimated_cost must not exceed the total trip budget.
-9. All costs must be non-negative numbers.
-10. If candidate activities are limited, schedule leisure, free-time, or scenic walking blocks rather than inventing attractions. Note any limitations in warnings.
+4. NEVER invent attraction names, venue names, parks, gardens, event dates, candidate IDs, or source URLs (e.g., do NOT invent 'Shinjuku Gyoen' or 'Tokyo Tower' if not in candidate list). Never use a candidate ID/URL with an unrelated activity name.
+5. Generic meals, rest periods, transit, and free exploration blocks must have candidate_id: null, source_url: null, and category 'dining', 'leisure', 'transit', or 'scenic_walk'. NEVER use 'attraction', 'event', or 'sightseeing' for generic blocks without a candidate_id. Do not invent restaurant names or claim generic activities are verified venues.
+6. SEPARATE BUDGET FROM ITINERARY (NO ACCOUNTING CATEGORIES AS ACTIVITIES):
+   - High-level category allocations (Accommodation, Food, Local Transportation, Activities, Contingency) belong EXCLUSIVELY in budget_breakdown.
+   - NEVER create scheduled activities named "Accommodation", "Food", "Local Transportation", "Contingency", "Hotel", "Reserve", or similar accounting buckets.
+   - Contingency reserve is an unspent safety cushion. NEVER treat contingency reserve as money spent, and NEVER schedule it as an activity.
+   - Do NOT force total_estimated_cost to equal the user's total budget. It is completely normal and expected for planned expenses to be less than the total trip budget.
+   - Costs must remain realistic estimates, not fabricated live prices.
+7. COHERENT DAY-BY-DAY SCHEDULING WITH VERIFIED CANDIDATES:
+   - Actively make use of verified candidate activities across all days (aim for 1 to 3 verified candidates per day when candidates are available).
+   - Each day should typically include 2 to 4 activities in total, combining verified candidates with approximate planned dining experiences (e.g., "Lunch in Gion District", "Dinner near Dotonbori"), local transit legs (e.g., "Local train transit to Arashiyama"), or scenic walks.
+   - Use approximate planned time blocks (e.g., "09:30 AM", "Morning", "02:00 PM", "Evening") and approximate durations (e.g., "2 hours", "1.5 hours"). NEVER claim these are verified opening hours, confirmed ticket prices, or official transit timetables.
+   - If candidate activities are limited, keep the plan honest: schedule leisure, scenic walking, or free-time blocks with candidate_id: null and source_url: null. Note research limitations in warnings. Do NOT fill days with generic filler activities or force every day to have equal expenditure.
+8. REGIONAL LOGISTICS & BROAD DESTINATIONS:
+   - When the destination is a broad country-level destination (e.g., "Japan", "Italy") that is too broad for single-trip daily logistics without domestic flights, focus the daily itinerary on the coherent geographic region supported by the research candidates (e.g., Kyoto/Kansai region), and explicitly disclose this assumption in "assumptions".
+9. USER INTERESTS AND PREFERENCES:
+   - Prefer verified activities matching traveler interests.
+   - Do NOT assume that interests or preferences (e.g., games, water sports, bike excursions) are available if the research has not verified suitable options.
+   - If an interest cannot be served by available evidence, schedule available verified attractions and free exploration, and include an explicit warning explaining the gap.
+   - Distinguish mandatory user constraints (dates, budget) from optional preferences (pace, notes).
+10. COST CONSISTENCY:
+   - The sum of all activity estimated_cost values for a day must equal that day's estimated_cost.
+   - The sum of all daily estimated_cost values must equal total_estimated_cost.
+   - total_estimated_cost must not exceed the total trip budget (and should stay within the planned expense ceiling: total_budget minus contingency).
+   - All costs must be non-negative numbers.
 11. If user feedback or requested modifications are provided, incorporate them into the plan while keeping unaffected days consistent.
 12. Return ONLY a single valid JSON object strictly matching the schema. Do not output markdown code fences, think tags, or extra commentary.
 
@@ -108,7 +164,10 @@ SCHEMA SPECIFICATION:
           "source_url": "https://... or null"
         }
       ],
-      "estimated_cost": 250.0
+      "estimated_cost": 250.0,
+      "cost_breakdown": {
+        "activities": 25.0
+      }
     }
   ],
   "summary": "string",
@@ -145,12 +204,17 @@ def _format_budget_prompt(budget_alloc: Any) -> str:
     b = budget_alloc.to_dict()
     breakdown_lines = [f"  - {cat}: {amount} {b['currency']}" for cat, amount in b["breakdown"].items()]
     return (
-        f"TOTAL GROUP BUDGET: {b['total_budget']} {b['currency']}\n"
-        f"BUDGET PER TRAVELER: {b['budget_per_traveler']} {b['currency']} ({b['traveler_count']} traveler(s))\n"
-        f"DAILY GROUP BUDGET CAP: {b['budget_per_day']} {b['currency']} ({b['trip_days']} day(s))\n"
-        f"PLANNED EXPENSE ALLOWANCE (AFTER {b['contingency_reserve']} {b['currency']} CONTINGENCY): {b['available_for_planned_expenses']} {b['currency']}\n"
-        f"CATEGORY ALLOCATIONS (ESTIMATES):\n" + "\n".join(breakdown_lines) + "\n"
-        f"NOTE: {b['notes']}"
+        f"""TOTAL GROUP BUDGET: {b['total_budget']} {b['currency']}
+BUDGET PER TRAVELER: {b['budget_per_traveler']} {b['currency']} ({b['traveler_count']} traveler(s))
+DAILY BUDGET REFERENCE: {b['budget_per_day']} {b['currency']} ({b['trip_days']} day(s))
+PLANNED EXPENSE CEILING: {b['available_for_planned_expenses']} {b['currency']} (Total budget minus {b['contingency_reserve']} {b['currency']} contingency reserve. Planned expenses MUST NOT exceed this.)
+CONTINGENCY RESERVE: {b['contingency_reserve']} {b['currency']} (SAFETY BUFFER ONLY - UNSPENT. DO NOT EMIT AS AN ACTIVITY OR COUNT AS SPENT.)
+CATEGORY ALLOCATION TARGETS (FOR REFERENCE ONLY - STORED IN budget_breakdown):
+"""
+        + "\n".join(breakdown_lines)
+        + f"""
+NOTE: {b['notes']}
+CRITICAL: Do NOT create scheduled activities named 'Accommodation', 'Food', 'Local Transportation', or 'Contingency'. Scheduled activities must only be real attractions, dining, or transit. Total estimated cost does NOT need to equal the total budget; remaining funds stay unspent."""
     )
 
 
@@ -262,6 +326,18 @@ def _validate_itinerary_grounding(
 
             category = str(act.get("category", "")).lower().strip()
 
+            norm_name = act_name.lower()
+            if norm_name in DISALLOWED_ACCOUNTING_NAMES or "contingency" in norm_name:
+                errors.append(
+                    f"Day {day_num} contains accounting category '{act_name}' as a scheduled activity. "
+                    "Accounting categories belong in budget_breakdown, not in scheduled activities."
+                )
+
+            if category in {"contingency", "accommodation", "lodging"}:
+                errors.append(
+                    f"Day {day_num} activity '{act_name}' has disallowed accounting category '{category}'."
+                )
+
             if cand_id:
                 if cand_id not in valid_candidates:
                     errors.append(
@@ -309,6 +385,19 @@ def _validate_itinerary_grounding(
                     if c is not None and c >= 0:
                         act_cost_sum = round(act_cost_sum + round(c, 2), 2)
 
+        cb = day.get("cost_breakdown")
+        if isinstance(cb, dict):
+            if "contingency" in cb or "reserve" in cb:
+                errors.append(
+                    f"Day {day_num} cost_breakdown includes contingency reserve. Reserve money must remain separate from planned expenditure."
+                )
+            for cat_k, cat_v in cb.items():
+                parsed_cat_v = _parse_safe_float(cat_v)
+                if parsed_cat_v is None or parsed_cat_v < 0:
+                    errors.append(
+                        f"Day {day_num} cost_breakdown category '{cat_k}' has invalid cost ({cat_v}). Must be non-negative."
+                    )
+
         raw_day_cost = day.get("estimated_cost", 0.0)
         parsed_day_cost = _parse_safe_float(raw_day_cost)
         if parsed_day_cost is None or parsed_day_cost < 0:
@@ -342,6 +431,19 @@ def _validate_itinerary_grounding(
         )
 
     return errors
+
+
+def _extract_choice_content(comp: Any, context_label: str = "generation") -> str:
+    """Extract completion content safely, raising PlannerError if choices or content is missing."""
+    choices = getattr(comp, "choices", None)
+    if not choices or not isinstance(choices, list) or len(choices) == 0:
+        raise PlannerError(f"Groq returned an empty choices list during {context_label}.")
+    first_choice = choices[0]
+    msg = getattr(first_choice, "message", None)
+    content = getattr(msg, "content", None) if msg else None
+    if not content or not str(content).strip():
+        raise PlannerError(f"Groq returned empty response content during {context_label}.")
+    return str(content).strip()
 
 
 def run_planner_agent(
@@ -379,6 +481,8 @@ def run_planner_agent(
         expected_dates.append(curr.isoformat())
         curr += timedelta(days=1)
     num_days = len(expected_dates)
+    if num_days > 14:
+        raise ValueError(f"Trip duration of {num_days} days exceeds the maximum allowed limit of 14 calendar days inclusive.")
 
     # 2. Normalize and validate research data
     normalized_research: dict[str, Any] = {}
@@ -424,22 +528,45 @@ def run_planner_agent(
     elif feedback:
         revision_context = f"\nUSER REVIEW FEEDBACK (Revision {revision_count}):\n{feedback}\nAddress this feedback while keeping unaffected days consistent."
 
+    preferences = request.get("preferences")
+    pref_str = ""
+    if preferences and isinstance(preferences, dict):
+        pref_parts = []
+        if preferences.get("pace"):
+            pref_parts.append(f"Pace: {preferences['pace']}")
+        if preferences.get("notes"):
+            pref_parts.append(f"Notes: {preferences['notes']}")
+        for k, v in preferences.items():
+            if k not in ("pace", "notes") and v:
+                pref_parts.append(f"{k.capitalize()}: {v}")
+        if pref_parts:
+            pref_str = "\nTRAVELER PREFERENCES: " + ", ".join(pref_parts)
+    elif preferences and isinstance(preferences, str) and preferences.strip():
+        pref_str = f"\nTRAVELER PREFERENCES: {preferences.strip()}"
+
     weather_notes = ""
     if normalized_research.get("weather"):
         weather_notes = f"\nDESTINATION WEATHER: {normalized_research['weather'].get('notes', 'Normal conditions.')}"
 
     user_prompt = (
-        f"Create a {num_days}-day itinerary for {destination} from {start_date_str} to {end_date_str}.\n\n"
-        f"TRAVEL DATES REQUIRED ({num_days} days): {', '.join(expected_dates)}\n"
-        f"TRAVELER INTERESTS: {', '.join(interests)}\n"
-        f"{weather_notes}\n\n"
-        f"--- BUDGET CONSTRAINTS ---\n{budget_text}\n\n"
-        f"--- CANDIDATE ACTIVITIES (SELECT FROM THESE) ---\n{candidates_text}\n"
-        f"{revision_context}\n\n"
-        "Generate strictly valid JSON conforming to the schema. "
-        "Use candidate_id and exact source_url for all researched attractions/events. "
-        "Use candidate_id: null and source_url: null for generic meals and free time. "
-        "Ensure daily costs sum to total_estimated_cost and do not exceed total group budget."
+        f"""Create a {num_days}-day itinerary for {destination} from {start_date_str} to {end_date_str}.
+
+TRAVEL DATES REQUIRED ({num_days} days): {', '.join(expected_dates)}
+TRAVELER INTERESTS: {', '.join(interests)}{pref_str}{weather_notes}
+
+--- BUDGET CONSTRAINTS ---
+{budget_text}
+
+--- CANDIDATE ACTIVITIES (SELECT FROM THESE) ---
+{candidates_text}
+{revision_context}
+
+Generate strictly valid JSON conforming to the schema.
+1. Distribute verified candidate activities across all days (aim for 1-3 verified candidates per day).
+2. Do NOT emit accounting categories (Accommodation, Food, Local Transportation, Contingency) as scheduled activities.
+3. Use candidate_id and exact source_url for all researched attractions/events.
+4. Generic meals, local transit, and free time must have candidate_id: null and source_url: null.
+5. Ensure daily costs sum to total_estimated_cost and do not exceed the planned expense ceiling."""
     )
 
     messages = [
@@ -466,10 +593,20 @@ def run_planner_agent(
             messages=messages,
             **groq_call_kwargs,
         )
-        content = completion.choices[0].message.content or ""
+        content = _extract_choice_content(completion, "initial generation")
         parsed_itinerary = _extract_and_parse_json(content)
     except Exception as exc:
         initial_error = exc
+
+    # Do not retry on rate limit errors
+    is_rate_limit = (
+        isinstance(initial_error, RateLimitError)
+        or "rate_limit" in str(initial_error).lower()
+        or getattr(initial_error, "status_code", None) == 429
+    )
+    if is_rate_limit:
+        sanitized_exc = _sanitize_error_message(str(initial_error))
+        raise PlannerError(f"Groq rate limit exceeded: {sanitized_exc}") from None
 
     # Bounded single correction attempt if initial generation call failed (e.g., json_validate_failed)
     if initial_error is not None:
@@ -485,11 +622,22 @@ def run_planner_agent(
                 messages=messages,
                 **groq_call_kwargs,
             )
-            content = correction_completion.choices[0].message.content or ""
+            content = _extract_choice_content(correction_completion, "correction attempt")
             parsed_itinerary = _extract_and_parse_json(content)
         except Exception as exc:
             sanitized_exc = _sanitize_error_message(str(exc))
             raise PlannerError(f"Groq itinerary generation failed after retry: {sanitized_exc}") from None
+
+    # Reconcile day and total costs mathematically from scheduled activity costs
+    if isinstance(parsed_itinerary, dict) and isinstance(parsed_itinerary.get("days"), list):
+        for d in parsed_itinerary["days"]:
+            if isinstance(d, dict) and isinstance(d.get("activities"), list):
+                valid_act_costs = [_parse_safe_float(a.get("estimated_cost")) for a in d["activities"] if isinstance(a, dict)]
+                if all(c is not None and c >= 0 for c in valid_act_costs):
+                    d["estimated_cost"] = round(sum(valid_act_costs), 2)
+        valid_day_costs = [_parse_safe_float(d.get("estimated_cost")) for d in parsed_itinerary["days"] if isinstance(d, dict)]
+        if all(c is not None and c >= 0 for c in valid_day_costs):
+            parsed_itinerary["total_estimated_cost"] = round(sum(valid_day_costs), 2)
 
     # Deterministic grounding verification
     errors = _validate_itinerary_grounding(
@@ -517,11 +665,22 @@ def run_planner_agent(
                 messages=messages,
                 **groq_call_kwargs,
             )
-            content = correction_completion.choices[0].message.content or ""
+            content = _extract_choice_content(correction_completion, "correction attempt")
             parsed_itinerary = _extract_and_parse_json(content)
         except Exception as exc:
             sanitized_exc = _sanitize_error_message(str(exc))
             raise PlannerError(f"Groq itinerary correction attempt failed: {sanitized_exc}") from None
+
+        # Reconcile day and total costs mathematically from scheduled activity costs
+        if isinstance(parsed_itinerary, dict) and isinstance(parsed_itinerary.get("days"), list):
+            for d in parsed_itinerary["days"]:
+                if isinstance(d, dict) and isinstance(d.get("activities"), list):
+                    valid_act_costs = [_parse_safe_float(a.get("estimated_cost")) for a in d["activities"] if isinstance(a, dict)]
+                    if all(c is not None and c >= 0 for c in valid_act_costs):
+                        d["estimated_cost"] = round(sum(valid_act_costs), 2)
+            valid_day_costs = [_parse_safe_float(d.get("estimated_cost")) for d in parsed_itinerary["days"] if isinstance(d, dict)]
+            if all(c is not None and c >= 0 for c in valid_day_costs):
+                parsed_itinerary["total_estimated_cost"] = round(sum(valid_day_costs), 2)
 
         # Re-validate after correction attempt
         errors = _validate_itinerary_grounding(
@@ -546,6 +705,39 @@ def run_planner_agent(
 
     if revision_count > 0 and "Revision" not in parsed_itinerary.get("summary", ""):
         parsed_itinerary["summary"] = f"{parsed_itinerary.get('summary', '')} (Revision {revision_count})"
+
+    # Disclose broad destination assumption
+    if destination.lower().strip() in BROAD_DESTINATIONS:
+        assumptions_list = parsed_itinerary.setdefault("assumptions", [])
+        has_broad_assumption = any(
+            "country" in a.lower() or "region" in a.lower() or "geographic" in a.lower()
+            for a in assumptions_list
+        )
+        if not has_broad_assumption:
+            assumptions_list.append(
+                f"Destination '{destination}' is a broad country-level destination. "
+                "Daily itinerary is geographically focused on the region supported by verified research candidates "
+                "to maintain feasible transit logistics without domestic flights."
+            )
+
+    # Check unserved interests and record explicit warnings
+    for interest in interests:
+        int_clean = str(interest).strip()
+        if not int_clean:
+            continue
+        has_match = any(
+            score_candidate(c, [int_clean.lower()]) > 0
+            for c in activity_lookup.candidates
+        )
+        if not has_match:
+            warning_msg = (
+                f"No verified research candidates were found for traveler interest '{int_clean}'. "
+                f"The itinerary prioritizes available verified attractions; travelers can explore '{int_clean}' "
+                f"during scheduled leisure or free-time blocks."
+            )
+            warnings_list = parsed_itinerary.setdefault("warnings", [])
+            if not any(int_clean.lower() in w.lower() for w in warnings_list):
+                warnings_list.append(warning_msg)
 
     if not activity_lookup.is_sufficient and activity_lookup.notes:
         warnings_list = parsed_itinerary.setdefault("warnings", [])

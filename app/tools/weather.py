@@ -350,21 +350,36 @@ def gather_weather_intelligence(
             ),
         )
 
-    # Scenario 3: Hybrid (partial forecast overlap)
+    # Scenario 3: All dates in the past (historical dates)
+    if not forecast_eligible_dates and not beyond_forecast_dates:
+        hist_comp = client.get_historical_comparison(coords.latitude, coords.longitude, coords.timezone, start_dt, end_dt)
+        return coords, WeatherContext(
+            weather_type="historical_comparison",
+            historical_comparison=hist_comp,
+            notes=(
+                "Travel dates are historical past dates. "
+                "Provided data reflects historical climate metrics over equivalent dates from the previous 3 years."
+            ),
+        )
+
+    # Scenario 4: Hybrid (partial forecast overlap)
     # Forecast covers dates within horizon; historical comparison covers ONLY dates beyond horizon
-    forecast_days = client.get_forecast(coords.latitude, coords.longitude, coords.timezone, forecast_eligible_dates)
-    
+    forecast_days = client.get_forecast(coords.latitude, coords.longitude, coords.timezone, forecast_eligible_dates) if forecast_eligible_dates else []
+
     covered_dates = sorted(list(forecast_eligible_dates))
     beyond_dates = sorted(beyond_forecast_dates)
-    hist_start_dt = beyond_dates[0]
-    hist_end_dt = beyond_dates[-1]
+    hist_comp = None
+    hist_range_str = "none"
 
-    hist_comp = client.get_historical_comparison(
-        coords.latitude, coords.longitude, coords.timezone, hist_start_dt, hist_end_dt
-    )
+    if beyond_dates:
+        hist_start_dt = beyond_dates[0]
+        hist_end_dt = beyond_dates[-1]
+        hist_comp = client.get_historical_comparison(
+            coords.latitude, coords.longitude, coords.timezone, hist_start_dt, hist_end_dt
+        )
+        hist_range_str = f"{hist_start_dt.isoformat()} to {hist_end_dt.isoformat()}"
 
     forecast_range_str = f"{covered_dates[0]} to {covered_dates[-1]}" if covered_dates else "none"
-    hist_range_str = f"{hist_start_dt.isoformat()} to {hist_end_dt.isoformat()}"
 
     return coords, WeatherContext(
         weather_type="hybrid",

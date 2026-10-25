@@ -59,6 +59,10 @@ class ItineraryDay(BaseModel):
         ge=0.0,
         description="Total estimated expenditure for this day.",
     )
+    cost_breakdown: Optional[dict[str, float]] = Field(
+        default=None,
+        description="Optional structured daily cost breakdown for accommodation, food, transportation, and activities.",
+    )
 
     @field_validator("estimated_cost")
     @classmethod

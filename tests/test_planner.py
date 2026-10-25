@@ -318,6 +318,7 @@ def test_planner_agent_evidence_passed_to_groq(sample_research_data):
     call_args = mock_groq.chat.completions.create.call_args[1]
     assert call_args["reasoning_effort"] == "low"
     assert call_args["include_reasoning"] is False
+    assert call_args["response_format"] == {"type": "json_object"}
     prompt_text = call_args["messages"][1]["content"]
 
     assert "Kyoto, Japan" in prompt_text
@@ -1011,6 +1012,7 @@ def test_planner_agent_retries_on_groq_json_validate_failed_and_succeeds(sample_
     for call in mock_groq.chat.completions.create.call_args_list:
         assert call[1]["reasoning_effort"] == "low"
         assert call[1]["include_reasoning"] is False
+        assert call[1]["response_format"] == {"type": "json_object"}
     assert result["destination"] == "Kyoto, Japan"
     assert result["days"][0]["activities"][0]["name"] == "Fushimi Inari Shrine"
 
@@ -1087,3 +1089,375 @@ def test_live_planner_smoke_test(sample_research_data):
     assert result["total_estimated_cost"] <= 500.0
     for day in result["days"]:
         assert len(day["activities"]) > 0
+
+
+def test_planner_agent_handles_empty_groq_choices_list(sample_research_data):
+    """Empty choices list from Groq raises PlannerError cleanly without list index error."""
+    mock_groq = MagicMock()
+    mock_resp = MagicMock()
+    mock_resp.choices = []
+    mock_groq.chat.completions.create.return_value = mock_resp
+
+    request = {
+        "destination": "Kyoto, Japan",
+        "start_date": "2026-11-01",
+        "end_date": "2026-11-02",
+        "total_trip_budget": 500.0,
+    }
+
+    with pytest.raises(PlannerError) as exc_info:
+        run_planner_agent(
+            request=request,
+            research=sample_research_data,
+            groq_client=mock_groq,
+        )
+
+    assert "empty choices list" in str(exc_info.value).lower()
+
+
+def test_planner_agent_handles_empty_model_output(sample_research_data):
+    """Empty content string from Groq raises PlannerError cleanly."""
+    mock_groq = MagicMock()
+    choice = MagicMock()
+    choice.message.content = ""
+    mock_groq.chat.completions.create.return_value = MagicMock(choices=[choice])
+
+    request = {
+        "destination": "Kyoto, Japan",
+        "start_date": "2026-11-01",
+        "end_date": "2026-11-02",
+        "total_trip_budget": 500.0,
+    }
+
+    with pytest.raises(PlannerError) as exc_info:
+        run_planner_agent(
+            request=request,
+            research=sample_research_data,
+            groq_client=mock_groq,
+        )
+
+    assert "empty response content" in str(exc_info.value).lower()
+
+
+def test_planner_agent_does_not_retry_on_rate_limit_error(sample_research_data):
+    """Rate-limit errors raise PlannerError immediately without immediate retry."""
+    mock_groq = MagicMock()
+    req = httpx.Request("POST", "https://api.groq.com/openai/v1/chat/completions")
+    resp = httpx.Response(429, request=req, json={"error": {"message": "Rate limit exceeded", "type": "rate_limit_exceeded"}})
+    rate_err = groq.RateLimitError(
+        message="Error code: 429 - Rate limit exceeded",
+        response=resp,
+        body={"error": {"message": "Rate limit exceeded", "type": "rate_limit_exceeded"}},
+    )
+    mock_groq.chat.completions.create.side_effect = rate_err
+
+    request = {
+        "destination": "Kyoto, Japan",
+        "start_date": "2026-11-01",
+        "end_date": "2026-11-02",
+        "total_trip_budget": 500.0,
+    }
+
+    with pytest.raises(PlannerError) as exc_info:
+        run_planner_agent(
+            request=request,
+            research=sample_research_data,
+            groq_client=mock_groq,
+        )
+
+    # Must NOT retry immediately on rate limit!
+    assert mock_groq.chat.completions.create.call_count == 1
+    assert "rate limit exceeded" in str(exc_info.value).lower()
+
+
+def test_planner_agent_rejects_trip_exceeding_14_days(sample_research_data):
+    """Planner agent enforces the 14-day trip duration ceiling."""
+    request = {
+        "destination": "Kyoto, Japan",
+        "start_date": "2026-11-01",
+        "end_date": "2026-11-16",  # 16 days
+        "total_trip_budget": 500.0,
+    }
+
+    with pytest.raises(ValueError, match="exceeds the maximum allowed limit of 14 calendar days"):
+        run_planner_agent(
+            request=request,
+            research=sample_research_data,
+        )
+
+def test_itinerary_grounding_rejects_accounting_categories_as_activities(sample_research_data):
+    """Grounding validator rejects accounting categories emitted as scheduled activities."""
+    candidate_lookup = lookup_activity_candidates(sample_research_data, min_required=1)
+    valid_candidates = {c.id: c for c in candidate_lookup.candidates}
+
+    invalid_itinerary = {
+        "destination": "Kyoto, Japan",
+        "total_days": 1,
+        "currency": "USD",
+        "total_estimated_cost": 250.0,
+        "days": [
+            {
+                "day": 1,
+                "date": "2026-11-01",
+                "focus": "Sightseeing",
+                "activities": [
+                    {
+                        "name": "Fushimi Inari Shrine",
+                        "description": "Visit shrine",
+                        "category": "attraction",
+                        "estimated_cost": 50.0,
+                        "candidate_id": "attr-1",
+                        "source_url": "https://example.com/fushimi",
+                    },
+                    {
+                        "name": "Accommodation",
+                        "description": "Hotel stay",
+                        "category": "accommodation",
+                        "estimated_cost": 100.0,
+                        "candidate_id": None,
+                        "source_url": None,
+                    },
+                    {
+                        "name": "Local Transportation",
+                        "description": "Train and bus passes",
+                        "category": "transit",
+                        "estimated_cost": 50.0,
+                        "candidate_id": None,
+                        "source_url": None,
+                    },
+                    {
+                        "name": "Contingency",
+                        "description": "Emergency reserve",
+                        "category": "contingency",
+                        "estimated_cost": 50.0,
+                        "candidate_id": None,
+                        "source_url": None,
+                    },
+                ],
+                "estimated_cost": 250.0,
+            }
+        ],
+        "summary": "Day 1 itinerary",
+        "assumptions": [],
+        "warnings": [],
+    }
+
+    errors = _validate_itinerary_grounding(
+        itinerary_data=invalid_itinerary,
+        expected_dates=["2026-11-01"],
+        max_budget=500.0,
+        valid_candidates=valid_candidates,
+        destination="Kyoto, Japan",
+        currency="USD",
+    )
+
+    err_text = " ".join(errors).lower()
+    assert "accounting category 'accommodation'" in err_text
+    assert "accounting category 'local transportation'" in err_text
+    assert "accounting category 'contingency'" in err_text
+
+
+def test_contingency_reserve_not_counted_as_spending(sample_research_data):
+    """Contingency reserve remains unspent; itinerary total need not equal full budget."""
+    alloc = calculate_budget_allocation(
+        total_trip_budget=1000.0,
+        currency="USD",
+        traveler_count=2,
+        trip_days=4,
+    )
+    # Contingency is 100.0 (10%), available for planned spending is 900.0
+    assert alloc.contingency_reserve == 100.0
+    assert alloc.available_for_planned_expenses == 900.0
+
+    candidate_lookup = lookup_activity_candidates(sample_research_data, min_required=1)
+    valid_candidates = {c.id: c for c in candidate_lookup.candidates}
+
+    # Total planned expenses = 60.0 (well below 900.0 ceiling and 1000.0 budget)
+    valid_partial_budget_itinerary = {
+        "destination": "Kyoto, Japan",
+        "total_days": 1,
+        "currency": "USD",
+        "total_estimated_cost": 60.0,
+        "days": [
+            {
+                "day": 1,
+                "date": "2026-11-01",
+                "focus": "Temples",
+                "activities": [
+                    {
+                        "name": "Fushimi Inari Shrine",
+                        "description": "Visit temple",
+                        "category": "attraction",
+                        "estimated_cost": 20.0,
+                        "candidate_id": "attr-1",
+                        "source_url": "https://example.com/fushimi",
+                    },
+                    {
+                        "name": "Lunch near Fushimi Inari Shrine",
+                        "description": "Local dining",
+                        "category": "dining",
+                        "estimated_cost": 40.0,
+                        "candidate_id": None,
+                        "source_url": None,
+                    },
+                ],
+                "estimated_cost": 60.0,
+            }
+        ],
+        "summary": "1-day trip",
+        "budget_breakdown": alloc.to_dict(),
+        "assumptions": [],
+        "warnings": [],
+    }
+
+    errors = _validate_itinerary_grounding(
+        itinerary_data=valid_partial_budget_itinerary,
+        expected_dates=["2026-11-01"],
+        max_budget=1000.0,
+        valid_candidates=valid_candidates,
+        destination="Kyoto, Japan",
+        currency="USD",
+    )
+    assert errors == []
+
+
+def test_unserved_interests_produce_warnings(sample_research_data):
+    """Interests with no verified candidates in research produce explicit warnings."""
+    mock_groq = MagicMock()
+    valid_plan = {
+        "destination": "Kyoto, Japan",
+        "total_days": 1,
+        "currency": "USD",
+        "total_estimated_cost": 50.0,
+        "days": [
+            {
+                "day": 1,
+                "date": "2026-11-01",
+                "focus": "Sightseeing",
+                "activities": [
+                    {
+                        "name": "Fushimi Inari Shrine",
+                        "description": "Historic shrine",
+                        "category": "attraction",
+                        "estimated_cost": 20.0,
+                        "candidate_id": "attr-1",
+                        "source_url": "https://example.com/fushimi",
+                    },
+                    {
+                        "name": "Lunch in Gion",
+                        "description": "Traditional lunch",
+                        "category": "dining",
+                        "estimated_cost": 30.0,
+                        "candidate_id": None,
+                        "source_url": None,
+                    },
+                ],
+                "estimated_cost": 50.0,
+            }
+        ],
+        "summary": "Sightseeing day",
+        "assumptions": [],
+        "warnings": [],
+    }
+    mock_resp = MagicMock()
+    mock_resp.choices = [MagicMock(message=MagicMock(content=json.dumps(valid_plan)))]
+    mock_groq.chat.completions.create.return_value = mock_resp
+
+    request = {
+        "destination": "Kyoto, Japan",
+        "start_date": "2026-11-01",
+        "end_date": "2026-11-01",
+        "total_trip_budget": 500.0,
+        "currency": "USD",
+        "interests": ["games", "sightseeing", "waters"],
+        "preferences": {
+            "pace": "moderate",
+            "notes": "open for bike rides, long tours can extend days",
+        },
+    }
+
+    result = run_planner_agent(
+        request=request,
+        research=sample_research_data,
+        groq_client=mock_groq,
+    )
+
+    warnings_text = " ".join(result.get("warnings", [])).lower()
+    # "games" and "waters" have no candidates in sample_research_data
+    assert "games" in warnings_text
+    assert "waters" in warnings_text
+
+
+def test_broad_destination_discloses_assumption(sample_research_data):
+    """Country-level destination discloses geographic focus assumption."""
+    mock_groq = MagicMock()
+    valid_plan = {
+        "destination": "Japan",
+        "total_days": 1,
+        "currency": "USD",
+        "total_estimated_cost": 50.0,
+        "days": [
+            {
+                "day": 1,
+                "date": "2026-11-01",
+                "focus": "Sightseeing",
+                "activities": [
+                    {
+                        "name": "Fushimi Inari Shrine",
+                        "description": "Historic shrine",
+                        "category": "attraction",
+                        "estimated_cost": 20.0,
+                        "candidate_id": "attr-1",
+                        "source_url": "https://example.com/fushimi",
+                    },
+                    {
+                        "name": "Lunch in Gion",
+                        "description": "Traditional lunch",
+                        "category": "dining",
+                        "estimated_cost": 30.0,
+                        "candidate_id": None,
+                        "source_url": None,
+                    },
+                ],
+                "estimated_cost": 50.0,
+            }
+        ],
+        "summary": "1 day trip",
+        "assumptions": [],
+        "warnings": [],
+    }
+    mock_resp = MagicMock()
+    mock_resp.choices = [MagicMock(message=MagicMock(content=json.dumps(valid_plan)))]
+    mock_groq.chat.completions.create.return_value = mock_resp
+
+    request = {
+        "destination": "Japan",
+        "start_date": "2026-11-01",
+        "end_date": "2026-11-01",
+        "total_trip_budget": 500.0,
+        "currency": "USD",
+        "interests": ["sightseeing"],
+    }
+
+    result = run_planner_agent(
+        request=request,
+        research=sample_research_data,
+        groq_client=mock_groq,
+    )
+
+    assumptions_text = " ".join(result.get("assumptions", [])).lower()
+    assert "broad country-level destination" in assumptions_text or "geographically focused" in assumptions_text
+
+
+def test_planner_uses_all_relevant_candidate_activities(sample_research_data):
+    """Candidate activities are ranked by traveler interests and formatted in prompt."""
+    candidate_lookup = lookup_activity_candidates(
+        research_data=sample_research_data,
+        interests=["temples", "culture"],
+        limit=20,
+        min_required=2,
+    )
+    assert candidate_lookup.is_sufficient is True
+    assert len(candidate_lookup.candidates) >= 2
+    top_cand = candidate_lookup.candidates[0]
+    assert "shrine" in top_cand.name.lower() or "temple" in top_cand.name.lower() or "temple" in top_cand.description.lower()

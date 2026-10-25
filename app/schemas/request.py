@@ -31,7 +31,19 @@ class TravelRequest(BaseModel):
         return cleaned
 
     @model_validator(mode="after")
-    def validate_date_order(self) -> "TravelRequest":
+    def validate_travel_dates(self) -> "TravelRequest":
+        today = date.today()
+        if self.start_date < today:
+            raise ValueError(
+                f"Trip start_date ({self.start_date.isoformat()}) cannot be earlier than the current date ({today.isoformat()})."
+            )
         if self.end_date < self.start_date:
-            raise ValueError("end_date must be greater than or equal to start_date.")
+            raise ValueError(
+                f"Trip end_date ({self.end_date.isoformat()}) cannot precede start_date ({self.start_date.isoformat()})."
+            )
+        duration_days = (self.end_date - self.start_date).days + 1
+        if duration_days > 14:
+            raise ValueError(
+                f"Trip duration of {duration_days} days exceeds the maximum allowed limit of 14 calendar days inclusive."
+            )
         return self

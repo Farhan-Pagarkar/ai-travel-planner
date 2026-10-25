@@ -1,3 +1,4 @@
+from datetime import date, timedelta
 """Tests for FastAPI endpoints exposing travel planning workflow."""
 
 from pathlib import Path
@@ -21,8 +22,8 @@ def client(tmp_path: Path):
 def sample_payload() -> dict[str, Any]:
     return {
         "destination": "Rome, Italy",
-        "start_date": "2026-10-01",
-        "end_date": "2026-10-04",
+        "start_date": "2026-11-01",
+        "end_date": "2026-11-04",
         "total_trip_budget": 1800.0,
         "currency": "EUR",
         "interests": ["architecture", "food", "history"],
@@ -312,3 +313,51 @@ def test_favicon_route(client: TestClient):
     """Verify favicon endpoint returns 204."""
     res = client.get("/favicon.ico")
     assert res.status_code == 204
+
+
+def test_create_plan_rejects_past_start_date(client: TestClient, sample_payload: dict[str, Any]):
+    """Requests with start_date earlier than today are rejected with 422 before external calls."""
+    payload = dict(sample_payload)
+    payload["start_date"] = (date.today() - timedelta(days=1)).isoformat()
+    payload["end_date"] = (date.today() + timedelta(days=3)).isoformat()
+
+    res = client.post("/plan", json=payload)
+    assert res.status_code == 422
+    err_msg = str(res.json())
+    assert "cannot be earlier than the current date" in err_msg or "cannot be in the past" in err_msg
+
+
+def test_create_plan_accepts_today_start_date(client: TestClient, sample_payload: dict[str, Any]):
+    """Requests with start_date equal to server's today date are accepted."""
+    payload = dict(sample_payload)
+    payload["start_date"] = date.today().isoformat()
+    payload["end_date"] = (date.today() + timedelta(days=3)).isoformat()
+
+    res = client.post("/plan", json=payload)
+    assert res.status_code == 200
+    assert res.json()["status"] == "awaiting_review"
+
+
+def test_create_plan_accepts_valid_14_day_trip(client: TestClient, sample_payload: dict[str, Any]):
+    """A trip of exactly 14 calendar days inclusive is accepted."""
+    payload = dict(sample_payload)
+    start = date.today() + timedelta(days=1)
+    payload["start_date"] = start.isoformat()
+    payload["end_date"] = (start + timedelta(days=13)).isoformat()  # 14 days inclusive
+
+    res = client.post("/plan", json=payload)
+    assert res.status_code == 200
+    assert res.json()["status"] == "awaiting_review"
+
+
+def test_create_plan_rejects_trip_exceeding_14_days(client: TestClient, sample_payload: dict[str, Any]):
+    """A trip exceeding 14 calendar days inclusive is rejected with 422."""
+    payload = dict(sample_payload)
+    start = date.today() + timedelta(days=1)
+    payload["start_date"] = start.isoformat()
+    payload["end_date"] = (start + timedelta(days=14)).isoformat()  # 15 days inclusive
+
+    res = client.post("/plan", json=payload)
+    assert res.status_code == 422
+    err_msg = str(res.json())
+    assert "exceeds the maximum allowed limit of 14 calendar days" in err_msg

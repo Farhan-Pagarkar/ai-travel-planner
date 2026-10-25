@@ -1,3 +1,44 @@
+// Date formatting & input initialization helpers
+function getLocalDateString(d) {
+  const year = d.getFullYear();
+  const month = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function initializeDateInputs() {
+  const startDateInput = document.getElementById("start_date");
+  const endDateInput = document.getElementById("end_date");
+  if (!startDateInput || !endDateInput) return;
+
+  const now = new Date();
+  const todayStr = getLocalDateString(now);
+
+  startDateInput.min = todayStr;
+  endDateInput.min = todayStr;
+
+  // Initialize with sensible future dates if empty: start in 7 days, 4-day trip
+  if (!startDateInput.value) {
+    const defaultStart = new Date(now);
+    defaultStart.setDate(defaultStart.getDate() + 7);
+    startDateInput.value = getLocalDateString(defaultStart);
+
+    const defaultEnd = new Date(defaultStart);
+    defaultEnd.setDate(defaultEnd.getDate() + 3);
+    endDateInput.value = getLocalDateString(defaultEnd);
+    endDateInput.min = startDateInput.value;
+  }
+
+  startDateInput.addEventListener("change", () => {
+    if (startDateInput.value) {
+      endDateInput.min = startDateInput.value;
+      if (endDateInput.value && endDateInput.value < startDateInput.value) {
+        endDateInput.value = startDateInput.value;
+      }
+    }
+  });
+}
+
 // AI Travel Planner - Frontend Application Logic
 
 let currentPlanId = null;
@@ -122,8 +163,22 @@ planForm.addEventListener("submit", async (e) => {
     showError(formError, "Start and end dates are required.");
     return;
   }
+  const todayStr = getLocalDateString(new Date());
+  if (startDate < todayStr) {
+    showError(formError, `Start date (${startDate}) cannot be in the past. Please select a date on or after today (${todayStr}).`);
+    return;
+  }
   if (endDate < startDate) {
-    showError(formError, "End date cannot be earlier than start date.");
+    showError(formError, "End date cannot precede start date.");
+    return;
+  }
+  const sParts = startDate.split("-").map(Number);
+  const eParts = endDate.split("-").map(Number);
+  const sDate = new Date(sParts[0], sParts[1] - 1, sParts[2]);
+  const eDate = new Date(eParts[0], eParts[1] - 1, eParts[2]);
+  const durationDays = Math.round((eDate - sDate) / (1000 * 60 * 60 * 24)) + 1;
+  if (durationDays > 14) {
+    showError(formError, `Trip duration (${durationDays} days) exceeds the maximum allowed limit of 14 calendar days inclusive.`);
     return;
   }
   const budget = parseFloat(rawBudget);
@@ -455,3 +510,6 @@ async function fetchFinalPlan(planId) {
     setLoading(false);
   }
 }
+
+// Initialize date inputs on load
+initializeDateInputs();

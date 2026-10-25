@@ -328,7 +328,10 @@ def run_researcher_agent(
             max_tokens=4096,
             temperature=0.2,
         )
-        content = completion.choices[0].message.content or "{}"
+        choices = getattr(completion, "choices", None)
+        if not choices or not isinstance(choices, list) or len(choices) == 0:
+            return {}
+        content = choices[0].message.content or "{}"
         parsed_json = json.loads(content)
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"Groq research synthesis returned invalid JSON: {exc}") from None
