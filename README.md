@@ -158,22 +158,6 @@ curl http://127.0.0.1:8000/plan/$PLAN_ID/final
 
 The final endpoint returns a conflict if the plan has not been approved. The workflow allows up to three revision cycles.
 
-## Tests
-
-Run the offline tests:
-
-```bash
-pytest -v
-```
-
-Live API tests are opt-in and require valid credentials:
-
-```bash
-RUN_LIVE_TESTS=1 pytest -v -m live
-```
-
-The default suite mocks external services and does not consume API credits.
-
 ## Design choices and limitations
 
 - **LangGraph** manages the workflow and review pause rather than custom polling logic.
