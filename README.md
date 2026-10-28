@@ -1,6 +1,6 @@
 # AI Travel Planner
 
-A small AI travel planning app built for the Express Analytics AI/ML Engineer take-home assignment. It uses FastAPI for the API, LangGraph to manage the planning workflow, Groq for LLM calls, Serper for web search, Open-Meteo for weather data, and SQLite to save workflow state.
+An AI travel planning app! It uses FastAPI for the API, LangGraph to manage the planning workflow, Groq for LLM calls, Serper for web search, Open-Meteo for weather data, and SQLite to save workflow state.
 
 ## What it does
 
